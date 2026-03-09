@@ -48,6 +48,11 @@ import signal
 import sys
 import time
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
 import numpy as np
 import pandas as pd
 import ray
@@ -115,6 +120,10 @@ def parse_args():
     parser.add_argument("--experiment_dir", type=str, default=EXPERIMENT_DIR)
     parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
     parser.add_argument("--global_seed", type=int, default=None)
+    parser.add_argument("--output_every", type=int, default=1,
+                        help="Print prompt+response sample every N training iterations (default: 1 = every iter).")
+    parser.add_argument("--val_show_n", type=int, default=3,
+                        help="Number of Math500 examples to display in full at each val step.")
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -219,10 +228,18 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
         prompt_str = tokenizer.apply_chat_template(
             chat_with_system, tokenize=False, add_generation_prompt=True
         )
+        # Extract the raw user question for display (first user-role message)
+        question = ""
+        for msg in chat:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                question = msg.get("content", "")
+                break
+
         task_datas.append({
             "prompt_str":   prompt_str,
             "ground_truth": str(gt),
             "data_source":  ds,
+            "question":     question,
         })
     return task_datas
 
@@ -334,18 +351,27 @@ def _postprocess_outputs(outputs, task_datas: list,
         total_scores.append(total)
 
         if debug_print and idx == 0:
-            tail = completion[-600:] if len(completion) > 600 else completion
             boxed = _extract_boxed(completion)
+            correct_str = "CORRECT" if binary_reward == 1.0 else "WRONG"
+            display_resp = completion if len(completion) <= 2000 else completion[:2000] + "\n  ... [truncated]"
             print("\n" + "=" * 70)
-            print("[TRAIN OUTPUT] Sample response:")
+            print("[TRAIN] Iteration sample")
+            print("─" * 70)
+            print("[PROMPT / QUESTION]")
+            print(f"  {data.get('question', '(question unavailable)')}")
+            print("─" * 70)
+            print("[MODEL RESPONSE]")
+            # indent each line for readability
+            for line in display_resp.splitlines():
+                print(f"  {line}")
+            print("─" * 70)
             print(f"  Ground Truth    : {data['ground_truth']}")
             print(f"  Extracted Answer: {boxed if boxed else '(none — no \\boxed{})'}")
-            print(f"  Correctness     : {binary_reward}")
+            print(f"  Result          : {correct_str}  (binary={binary_reward:.1f})")
             print(f"  Entropy Proxy   : {ent:.4f}")
             if entropy_coeff > 0.0:
                 print(f"  Entropy Bonus   : {entropy_coeff * ent:.6f}")
                 print(f"  Total Reward    : {total:.4f}")
-            print(f"  Response (tail) :\n    ...{tail}")
             print("=" * 70 + "\n")
 
     return {
@@ -362,44 +388,156 @@ def _postprocess_outputs(outputs, task_datas: list,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
-                     iteration: int, writer, verbose: bool = False) -> float:
+                     iteration: int, writer, val_show_n: int = 3) -> float:
     """
     On-the-go greedy evaluation on math500 (or any val set).
 
     Uses engine 0, which holds the current best weights after each ES update
     and NCCL broadcast.  Greedy decoding (temperature=0) for deterministic
     accuracy.
+
+    Shows the question, full reasoning chain, extracted answer and
+    correct/wrong label for the first val_show_n examples.
     """
     batch = val_task_datas[:val_batch_size]
     prompts = [d["prompt_str"] for d in batch]
     sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
 
-    print(f"\n[VAL] Iter {iteration}: evaluating {len(batch)} examples (greedy)...")
+    print(f"\n{'#' * 70}")
+    print(f"  [VAL] Iter {iteration} — Math500 greedy eval on {len(batch)} examples")
+    print(f"{'#' * 70}")
     outputs = ray.get(engine.generate.remote(prompts, sampling_params, use_tqdm=False))
 
     correct = 0.0
+    correctness_list = []
     for output, data in zip(outputs, batch):
-        correct += float(compute_score(
+        c = float(compute_score(
             data_source=data.get("data_source", "deepscaler"),
             solution_str=output.outputs[0].text,
             ground_truth=data["ground_truth"],
             use_think=False,
         ))
+        correct += c
+        correctness_list.append(c)
 
     accuracy = correct / len(batch)
-    print(f"[VAL] accuracy = {accuracy:.4f}  ({int(correct)}/{len(batch)})")
 
-    if verbose and outputs:
-        completion = outputs[0].outputs[0].text
-        tail = completion[-400:] if len(completion) > 400 else completion
+    # Show first val_show_n examples with full prompt + reasoning chain
+    for idx in range(min(val_show_n, len(batch))):
+        data = batch[idx]
+        completion = outputs[idx].outputs[0].text
         boxed = _extract_boxed(completion)
-        print(f"\n[VAL SAMPLE]  gt={batch[0]['ground_truth']}"
-              f"  pred={boxed if boxed else '(none)'}")
-        print(f"  ...{tail}\n")
+        is_correct = correctness_list[idx] == 1.0
+        result_tag = "✓ CORRECT" if is_correct else "✗ WRONG"
+        display_resp = completion if len(completion) <= 2000 else completion[:2000] + "\n  ... [truncated]"
+
+        print(f"\n{'─' * 70}")
+        print(f"[VAL EXAMPLE {idx + 1}/{min(val_show_n, len(batch))}]  {result_tag}")
+        print("─" * 70)
+        print("[QUESTION]")
+        print(f"  {data.get('question', '(question unavailable)')}")
+        print("─" * 70)
+        print("[REASONING CHAIN]")
+        for line in display_resp.splitlines():
+            print(f"  {line}")
+        print("─" * 70)
+        print(f"  Ground Truth    : {data['ground_truth']}")
+        print(f"  Extracted Answer: {boxed if boxed else '(none — no \\boxed{})'}")
+        print(f"  Result          : {result_tag}")
+        print("─" * 70)
+
+    print(f"\n[VAL] accuracy = {accuracy:.4f}  ({int(correct)}/{len(batch)})")
+    print(f"{'#' * 70}\n")
 
     if writer is not None:
         writer.add_scalar("val/accuracy", accuracy, iteration)
     return accuracy
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plotting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_plots(history: dict, output_dir: str):
+    """
+    Save thesis-quality training curves as a single PNG figure.
+
+    Panels:
+      (top-left)     Train correctness vs iteration
+      (top-right)    Math500 val accuracy vs iteration  (with baseline marker)
+      (bottom-left)  ES reward mean ± std band vs iteration
+      (bottom-right) Response entropy proxy vs iteration
+    """
+    iters = history["iter"]
+    if not iters:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    fig.suptitle(
+        "ES-RLVR  ·  One-Shot Training on Single Example → Math500 Generalisation",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+
+    # ── Top-left: train correctness ──────────────────────────────────────────
+    ax = axes[0, 0]
+    ax.plot(iters, history["train_correctness"],
+            color="tab:blue", linewidth=1.5, label="train correctness")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Mean Correctness")
+    ax.set_title("Training Correctness (single example)")
+    ax.set_ylim(-0.05, 1.10)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+
+    # ── Top-right: val accuracy ───────────────────────────────────────────────
+    ax = axes[0, 1]
+    if history["val_iter"]:
+        ax.plot(history["val_iter"], history["val_accuracy"],
+                color="tab:orange", marker="o", linewidth=2,
+                markersize=5, label="Math500 accuracy")
+        baseline = history["val_accuracy"][0]
+        ax.axhline(baseline, linestyle="--", color="gray", alpha=0.7,
+                   label=f"Baseline {baseline:.1%}")
+        best = max(history["val_accuracy"])
+        ax.axhline(best, linestyle=":", color="tab:green", alpha=0.7,
+                   label=f"Best {best:.1%}")
+        ax.legend(fontsize=9)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Math500 Validation Accuracy")
+    ax.set_ylim(-0.05, 1.10)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+    ax.grid(True, alpha=0.3)
+
+    # ── Bottom-left: reward mean ± std ────────────────────────────────────────
+    ax = axes[1, 0]
+    means = np.array(history["reward_mean"])
+    stds  = np.array(history["reward_std"])
+    ax.plot(iters, means, color="tab:green", linewidth=1.5, label="mean reward")
+    ax.fill_between(iters, means - stds, means + stds,
+                    alpha=0.20, color="tab:green", label="±1 std")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Total Reward (binary + entropy bonus)")
+    ax.set_title("ES Population Reward")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # ── Bottom-right: entropy proxy ───────────────────────────────────────────
+    ax = axes[1, 1]
+    ax.plot(iters, history["entropy"],
+            color="tab:purple", linewidth=1.5, label="entropy proxy")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("−mean(log p)  per token")
+    ax.set_title("Response Entropy Proxy")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, "training_curves.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[PLOT] Saved → {plot_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -511,6 +649,19 @@ def main(args):
     print(f"  Log dir        : {logging_dir}")
     print("=" * 70 + "\n")
 
+    # ── Metrics history (for plots + CSV) ────────────────────────────────────
+    history = {
+        "iter":               [],
+        "train_correctness":  [],
+        "reward_mean":        [],
+        "reward_std":         [],
+        "entropy":            [],
+        "val_iter":           [],
+        "val_accuracy":       [],
+    }
+    csv_path = os.path.join(logging_dir, "metrics.csv")
+    csv_header_written = False
+
     # ──────────────────────────────────────────────────────────────────────────
     # Training loop
     # ──────────────────────────────────────────────────────────────────────────
@@ -535,7 +686,7 @@ def main(args):
             seed_tasks = [(s, False) for s in base_seeds]
 
         seeds_perf: dict = {}            # (seed, negate) → metrics
-        debug_this_gen = (i % 10 == 0)  # print output sample every 10 iters
+        debug_this_gen = (i % args.output_every == 0)
         debug_fired    = False
 
         seed_iter = iter(seed_tasks)
@@ -654,6 +805,30 @@ def main(args):
                 max(r["avg_correctness"] for r in results_this_gen), i,
             )
 
+        # ── Update metrics history + CSV ──────────────────────────────────────
+        history["iter"].append(i)
+        history["train_correctness"].append(mean_c)
+        history["reward_mean"].append(mean_r)
+        history["reward_std"].append(std_r)
+        history["entropy"].append(mean_e)
+
+        csv_row = {
+            "iter":              i,
+            "train_correctness": mean_c,
+            "reward_mean":       mean_r,
+            "reward_std":        std_r,
+            "entropy":           mean_e,
+            "val_accuracy":      "",   # filled in at val steps
+        }
+        write_mode = "w" if not csv_header_written else "a"
+        with open(csv_path, write_mode, newline="") as f:
+            import csv as _csv
+            w = _csv.DictWriter(f, fieldnames=list(csv_row.keys()))
+            if not csv_header_written:
+                w.writeheader()
+                csv_header_written = True
+            w.writerow(csv_row)
+
         # ── ES weight update on engine 0 ──────────────────────────────────────
         # Antithetic: Δθ += (α/N) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
         # Standard:   Δθ += (α/N) × Aᵢ × εᵢ
@@ -708,10 +883,25 @@ def main(args):
         if val_task_datas and (
             i % args.val_every == 0 or i == args.num_iterations - 1
         ):
-            evaluate_val_set(
+            val_acc = evaluate_val_set(
                 engines[0], val_task_datas, args.val_batch_size,
-                i, writer, args.verbose,
+                i, writer, val_show_n=args.val_show_n,
             )
+            history["val_iter"].append(i)
+            history["val_accuracy"].append(val_acc)
+            # Update CSV val_accuracy column for this iter (append a marker row)
+            with open(csv_path, "a", newline="") as f:
+                import csv as _csv
+                w = _csv.DictWriter(f, fieldnames=[
+                    "iter", "train_correctness", "reward_mean",
+                    "reward_std", "entropy", "val_accuracy",
+                ])
+                w.writerow({
+                    "iter": f"val@{i}", "train_correctness": "",
+                    "reward_mean": "", "reward_std": "",
+                    "entropy": "", "val_accuracy": val_acc,
+                })
+            save_plots(history, logging_dir)
 
     # ── Save final model weights ──────────────────────────────────────────────
     final_path = f"{model_saves_dir}/final_model_iter_{args.num_iterations}"
@@ -723,6 +913,9 @@ def main(args):
         )
     )
     print(f"\n[SAVE] Final weights saved to {final_path}/pytorch_model.pth")
+
+    save_plots(history, logging_dir)
+    print(f"[CSV]  Metrics log → {csv_path}")
 
     cleanup()
     writer.close()

@@ -60,6 +60,8 @@ ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"
 VAL_EVERY="${VAL_EVERY:-10}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-50}"
 GLOBAL_SEED="${GLOBAL_SEED:-42}"
+OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
+VAL_SHOW_N="${VAL_SHOW_N:-3}"       # show N math500 examples in full per eval
 
 SCRIPT="${BASE_DIR}/es_rlvr_train.py"
 
@@ -78,6 +80,8 @@ python "${SCRIPT}" \
   --cuda_devices      0,1,2,3 \
   --global_seed       "${GLOBAL_SEED}" \
   --experiment_dir    "${OUT_DIR}/es_experiment" \
+  --output_every      "${OUTPUT_EVERY}" \
+  --val_show_n        "${VAL_SHOW_N}" \
   --antithetic \
   --verbose
 
