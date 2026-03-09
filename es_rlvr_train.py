@@ -531,52 +531,186 @@ def compute_grpo_advantages(rewards: List[float], eps: float = 1e-6) -> List[flo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entropy & KL  (white-box, separate from ES reward — OneShot-RLVR faithful)
+# Entropy & KL  (white-box, separate from ES reward — verl faithful)
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# verl reference:  verl/trainer/ppo/core_algos.py
+#
+#   def compute_entropy_loss(logits, eos_mask):
+#       entropy = verl_F.entropy_from_logits(logits)   # response logits only
+#       entropy_loss = verl_F.masked_mean(entropy, mask=eos_mask)
+#       return entropy_loss
+#
+# Two things the original script got wrong that are fixed here:
+#   1. Scope  — verl operates on response-only logits, not the full sequence.
+#               Prompt tokens must be stripped before computing entropy / KL.
+#   2. eos_mask — verl uses masked_mean with a binary mask that is 1 for every
+#               response token up to and including the first EOS, then 0.
+#               Plain .mean() over all positions (including post-EOS padding)
+#               dilutes the signal and does not match verl.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _build_eos_mask(response_ids: torch.Tensor, eos_token_id: int) -> torch.Tensor:
+    """
+    Build the eos_mask used by verl.masked_mean.
+
+    mask[t] = 1  for all response token positions t up to and including
+                 the first EOS token (EOS itself counts as a valid step).
+    mask[t] = 0  for all positions strictly after the first EOS.
+
+    If no EOS is present the entire response is considered valid (all 1s).
+
+    Parameters
+    ----------
+    response_ids   : (R,) int tensor — token ids for the response portion only
+    eos_token_id   : the EOS token id from the tokenizer
+    """
+    eos_positions = (response_ids == eos_token_id).nonzero(as_tuple=True)[0]
+    if len(eos_positions) == 0:
+        return torch.ones(len(response_ids), dtype=torch.float32,
+                          device=response_ids.device)
+    first_eos = int(eos_positions[0].item())
+    mask = torch.zeros(len(response_ids), dtype=torch.float32,
+                       device=response_ids.device)
+    mask[: first_eos + 1] = 1.0   # include EOS position
+    return mask
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor,
+                 eps: float = 1e-8) -> torch.Tensor:
+    """
+    verl_F.masked_mean: weighted mean where mask selects valid positions.
+    values, mask: (R,) — response-length tensors.
+    """
+    return (values * mask).sum() / (mask.sum() + eps)
+
+
+def _entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """
+    verl_F.entropy_from_logits.
+    Numerically stable categorical entropy from raw logits.
+
+    H(t) = -Σ_v  softmax(logits_t)_v * log_softmax(logits_t)_v
+
+    Using F.log_softmax (which internally applies the log-sum-exp trick)
+    avoids underflow for large-magnitude logits, matching verl's stable path.
+
+    Parameters
+    ----------
+    logits : (R, V) — response-position logits
+    Returns
+    -------
+    entropy : (R,) — per-token entropy
+    """
+    log_probs = F.log_softmax(logits, dim=-1)   # (R, V)
+    entropy = -(log_probs.exp() * log_probs).sum(dim=-1)  # (R,)
+    return entropy
+
+
+def _encode_prompt_and_full(
+    tokenizer,
+    prompt: str,
+    response: str,
+    max_prompt_len: int,
+    max_full_len: int,
+    device: torch.device,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, int]]:
+    """
+    Tokenise prompt alone and prompt+response together.
+
+    Returns
+    -------
+    full_ids    : (1, T) token ids for the full sequence
+    response_ids: (R,)  token ids for the response portion only
+    prompt_len  : number of tokens in the prompt
+
+    Returns None when the response is empty (nothing to compute over).
+    """
+    prompt_ids = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_prompt_len,
+        add_special_tokens=True,
+    ).input_ids.to(device)
+    prompt_len = int(prompt_ids.shape[1])
+
+    full_enc = tokenizer(
+        prompt + response,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_full_len,
+        add_special_tokens=True,
+    ).to(device)
+    full_ids = full_enc.input_ids   # (1, T)
+    T = int(full_ids.shape[1])
+
+    if T <= prompt_len:
+        return None   # response was truncated away entirely
+
+    response_ids = full_ids[0, prompt_len:]   # (R,)
+    return full_ids, full_enc, response_ids, prompt_len
+
 
 def compute_entropy_loss(
     model,
     tokenizer,
-    texts: List[str],
+    prompt_response_pairs: List[Tuple[str, str]],
     device: torch.device,
-    max_length: int,
+    max_prompt_len: int,
+    max_full_len: int,
 ) -> torch.Tensor:
     """
-    Token-level entropy bonus.
+    Token-level entropy bonus — verl faithful.
 
-    Matches OneShot-RLVR verl/trainer/ppo/core_algos.py compute_entropy_loss():
-      entropy(t) = -Σ_v  π(v|context_t) * log π(v|context_t)
-      loss = -mean(entropy)   ← minimising this maximises entropy
+    verl core_algos.py:
+        entropy = verl_F.entropy_from_logits(logits)   # response logits only
+        entropy_loss = verl_F.masked_mean(entropy, mask=eos_mask)
 
-    Computed analytically via autograd on the current (un-perturbed) model.
-    Separate from the ES reward signal.
+    Steps (matching verl exactly):
+      1. Slice to response-only logits   (strip prompt positions)
+      2. Compute entropy_from_logits     (numerically stable)
+      3. Build eos_mask                  (1 up to first EOS, 0 after)
+      4. masked_mean                     (only valid response tokens count)
+      5. Return -mean(entropy)           (minimise to maximise H)
+
+    Parameters
+    ----------
+    prompt_response_pairs : list of (prompt_str, response_str) tuples
     """
     entropy_vals: List[torch.Tensor] = []
 
-    for text in texts[:4]:  # cap at 4 texts for speed
-        enc = tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_length,
-        ).to(device)
-
-        if enc.input_ids.shape[1] < 2:
+    for prompt, response in prompt_response_pairs[:4]:
+        result = _encode_prompt_and_full(
+            tokenizer, prompt, response,
+            max_prompt_len, max_full_len, device,
+        )
+        if result is None:
             continue
+        full_ids, full_enc, response_ids, prompt_len = result
+        T = int(full_ids.shape[1])
+        R = int(response_ids.shape[0])
 
+        # Forward pass — gradients flow through response logits only
         with torch.enable_grad():
-            logits = model(**enc).logits[:, :-1, :]   # (1, T-1, V)
+            all_logits = model(**full_enc).logits  # (1, T, V)
 
-        log_probs = F.log_softmax(logits, dim=-1)     # (1, T-1, V)
-        probs = log_probs.exp()
-        entropy = -(probs * log_probs).sum(dim=-1)    # (1, T-1)
-        entropy_vals.append(entropy.mean())
+        # Response logits: position (prompt_len-1) predicts token at prompt_len,
+        # position (T-2) predicts token at T-1 — so slice [prompt_len-1 : T-1].
+        response_logits = all_logits[0, prompt_len - 1: T - 1, :]  # (R, V)
+
+        # verl_F.entropy_from_logits
+        entropy = _entropy_from_logits(response_logits)   # (R,)
+
+        # verl eos_mask  +  verl_F.masked_mean
+        eos_mask = _build_eos_mask(response_ids, tokenizer.eos_token_id)
+        entropy_vals.append(_masked_mean(entropy, eos_mask))
 
     if not entropy_vals:
         return torch.tensor(0.0, device=device)
 
-    # Return *negative* mean entropy as a loss to be minimised
-    # (minimising -H maximises entropy, i.e. encourages exploration)
+    # Negate: minimising -H(π) maximises entropy (exploration bonus)
     return -torch.stack(entropy_vals).mean()
 
 
@@ -584,50 +718,58 @@ def compute_kl_loss(
     model,
     ref_model,
     tokenizer,
-    texts: List[str],
+    prompt_response_pairs: List[Tuple[str, str]],
     device: torch.device,
-    max_length: int,
+    max_prompt_len: int,
+    max_full_len: int,
 ) -> torch.Tensor:
     """
-    Low-variance KL divergence against the frozen reference model.
+    Low-variance KL divergence against the frozen reference model — verl faithful.
 
-    Direct port of OneShot-RLVR verl/trainer/ppo/core_algos.py
-    kl_penalty(kl_penalty='low_var_kl'):
-      kl  = log π_ref - log π          # log ratio
-      kld = exp(kl) - kl - 1           # low-var Schulman 2020 approximation
-      kld = clamp(kld, -10, 10)
+    verl core_algos.py kl_penalty('low_var_kl'):
+        kl  = ref_logprob - logprob          # log(π_ref / π)
+        kld = exp(kl) - kl - 1              # Schulman 2020 low-var approx
+        kld = clamp(kld, -10, 10)
 
-    Computed analytically via autograd on the current model only.
-    Separate from the ES reward signal.
+    Applied with eos_mask + masked_mean over response tokens only,
+    matching the same scoping rule used for entropy above.
     """
     kl_vals: List[torch.Tensor] = []
 
-    for text in texts[:4]:
-        enc = tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_length,
-        ).to(device)
-
-        if enc.input_ids.shape[1] < 2:
+    for prompt, response in prompt_response_pairs[:4]:
+        result = _encode_prompt_and_full(
+            tokenizer, prompt, response,
+            max_prompt_len, max_full_len, device,
+        )
+        if result is None:
             continue
+        full_ids, full_enc, response_ids, prompt_len = result
+        T = int(full_ids.shape[1])
 
+        # Actor logits (grad flows through these)
         with torch.enable_grad():
-            logits = model(**enc).logits[:, :-1, :]           # (1, T-1, V)
+            all_logits = model(**full_enc).logits        # (1, T, V)
 
+        # Reference logits (frozen, no grad)
         with torch.no_grad():
-            ref_logits = ref_model(**enc).logits[:, :-1, :]   # (1, T-1, V)
+            ref_all_logits = ref_model(**full_enc).logits  # (1, T, V)
 
-        log_p = F.log_softmax(logits, dim=-1)
-        log_ref = F.log_softmax(ref_logits, dim=-1).detach()
+        # Slice to response positions only
+        resp_logits     = all_logits[0, prompt_len - 1: T - 1, :]      # (R, V)
+        resp_ref_logits = ref_all_logits[0, prompt_len - 1: T - 1, :]  # (R, V)
 
-        # low_var_kl:  exp(log_ref - log_p) - (log_ref - log_p) - 1
-        kl_per_token = log_ref - log_p            # (1, T-1, V)
-        ratio = torch.exp(kl_per_token)
-        kld = (ratio - kl_per_token - 1).mean(dim=-1)  # (1, T-1)
-        kld = kld.clamp(-10, 10)                        # matches OneShot-RLVR
-        kl_vals.append(kld.mean())
+        log_p   = F.log_softmax(resp_logits, dim=-1)              # (R, V)
+        log_ref = F.log_softmax(resp_ref_logits, dim=-1).detach() # (R, V)
+
+        # low_var_kl per token, summed over vocab then masked over time
+        kl_per_token_vocab = log_ref - log_p                      # (R, V)
+        ratio = torch.exp(kl_per_token_vocab)
+        kld_vocab = ratio - kl_per_token_vocab - 1                # (R, V)
+        kld = kld_vocab.sum(dim=-1)                               # (R,)
+        kld = kld.clamp(-10, 10)                                  # verl clip
+
+        eos_mask = _build_eos_mask(response_ids, tokenizer.eos_token_id)
+        kl_vals.append(_masked_mean(kld, eos_mask))
 
     if not kl_vals:
         return torch.tensor(0.0, device=device)
@@ -951,23 +1093,25 @@ class ESRLVRTrainer:
             if name in es_grad:
                 param.grad = -es_grad[name].clone()
 
-        # 2. Entropy loss — separate white-box term (analytical autograd)
-        #    Use a sample of (prompt + response) pairs as context
-        context_texts = [
-            p + r for p, r in zip(all_prompts[:4], all_resp[:4])
-        ]
-
-        max_ctx = cfg.max_prompt_length + cfg.max_new_tokens
+        # 2. Entropy loss — separate white-box term (verl faithful)
+        #    Pass (prompt, response) pairs so each function can:
+        #      a) strip prompt tokens → response-only logits
+        #      b) build eos_mask → masked_mean over valid response positions
+        pr_pairs = list(zip(all_prompts[:4], all_resp[:4]))
 
         entropy_loss = compute_entropy_loss(
             self.model, self.tokenizer,
-            context_texts, self.device, max_ctx,
+            pr_pairs, self.device,
+            cfg.max_prompt_length,
+            cfg.max_prompt_length + cfg.max_new_tokens,
         )
 
-        # 3. KL loss — separate white-box term (low_var_kl, OneShot-RLVR)
+        # 3. KL loss — separate white-box term (low_var_kl, verl faithful)
         kl_loss = compute_kl_loss(
             self.model, self.ref_model, self.tokenizer,
-            context_texts, self.device, max_ctx,
+            pr_pairs, self.device,
+            cfg.max_prompt_length,
+            cfg.max_prompt_length + cfg.max_new_tokens,
         )
 
         # Combine entropy + KL and backprop into existing .grad
