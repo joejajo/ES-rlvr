@@ -1,1274 +1,733 @@
 #!/usr/bin/env python3
 """
-ES-RLVR: Evolution Strategies for Reinforcement Learning with Verified Rewards
-===============================================================================
-Methodology adapted from One-Shot-RLVR (ypwang61/One-Shot-RLVR, NeurIPS 2025)
+ES-RLVR: Evolution Strategies + One-Shot-RLVR with vLLM + Ray + NCCL
+======================================================================
+Architecture: adapted from VsonicV/es-fine-tuning-paper
+Methodology:  adapted from ypwang61/One-Shot-RLVR (NeurIPS 2025)
 
-Optimization backbone: OpenAI-ES / NES antithetic sampling over LoRA adapters.
+One-Shot-RLVR design principles preserved
+------------------------------------------
+- Binary correctness reward ONLY (deepscaler.compute_score).
+  No format reward — 0.0 if no \\boxed{} found, full stop.
+- GRPO reward normalisation (z-score across population):
+    Aᵢ = (rᵢ − mean(R)) / (std(R) + ε)
+  This is mathematically identical to the ES z-score normalisation —
+  both formulas are the same; GRPO normalises across group rollouts,
+  ES normalises across population perturbations.
+- Entropy bonus as a separate term (coeff=0.001):
+    bonus = entropy_coeff × entropy_proxy
+  True Shannon entropy requires full-vocabulary logprobs, which vLLM
+  does not expose cheaply.  We use the tractable per-token proxy:
+    entropy_proxy = −mean(log p_chosen_token)   (over response tokens)
+  Higher proxy → model more uncertain / exploratory, same qualitative
+  effect as the white-box entropy term in OneShot-RLVR.
+- KL penalty: omitted.  Computing low_var_kl requires a reference model
+  forward pass.  In a pure vLLM inference architecture there is no
+  autograd model resident in memory, so this term is not feasible
+  without a separate HuggingFace inference pass per perturbation.
+- Antithetic pairs (±ε) for variance reduction.
+- On-the-go validation on math500 every val_every iterations.
+- Model output display during training (every 10 iters by default).
 
-How it works
-------------
-1. DATA (One-Shot-RLVR faithful)
-   Select the single highest-variance training example from the dataset using
-   the 'std' method (rank by std of probe accuracies, matching data_selection.py).
-   Duplicate it `batch_repeat` times to fill each training step's batch.
-
-2. ES GRADIENT ESTIMATION (black-box, reward signal)
-   For each step, sample n_pairs noise vectors εᵢ ~ N(0, I) matching the shape
-   of every LoRA parameter.  Use antithetic pairs (±):
-     a. θ⁺ᵢ = θ + σ·εᵢ  →  generate G completions per prompt  →  rewards R⁺ᵢ
-     b. θ⁻ᵢ = θ - σ·εᵢ  →  generate G completions per prompt  →  rewards R⁻ᵢ
-   Pool all 2·n_pairs·G rewards from the same prompt and apply GRPO group
-   normalisation (compute_grpo_outcome_advantage from core_algos.py):
-     Aⱼ = (rⱼ - mean(R)) / (std(R) + ε)
-   ES gradient estimate (antithetic):
-     ∇J ≈ (1 / n_pairs·σ) · Σᵢ (mean(A⁺ᵢ) - mean(A⁻ᵢ)) · εᵢ
-
-3. ENTROPY (white-box, separate term — OneShot-RLVR entropy_coeff=0.001)
-   Computed analytically from the current (un-perturbed) model via autograd:
-     H(π) = -Σ π(a|s) log π(a|s)
-   Gradient of -H is added to bring in the entropy bonus.
-
-4. KL DIVERGENCE (white-box, separate — low_var_kl, clamped [-10, 10])
-   Computed analytically against the frozen reference model:
-     KL_low_var = exp(log π_ref - log π) - (log π_ref - log π) - 1
-   This is the exact formulation from OneShot-RLVR kl_penalty('low_var_kl').
-
-5. TOTAL UPDATE
-   grad_total = -ES_grad  +  entropy_coeff · ∇(-H)  +  kl_coeff · ∇KL
-   (negative ES because AdamW does descent; we want to ascend the reward)
-
-Reward (OneShot-RLVR deepscaler.py faithful)
---------------------------------------------
-- Extract last \\boxed{} from the response.
-- Return 1.0 if correct, 0.0 otherwise.
-- NO format reward — zero if no \\boxed{} found, full stop.
-- Graded via string normalisation + optional sympy symbolic comparison.
-
-Training visibility
--------------------
-- Prints model outputs (prompt tail / full response / extracted answer / reward)
-  every `log_every` steps.
-- On-the-go validation accuracy printed every `eval_every` steps.
+ES weight update (antithetic)
+------------------------------
+For each seed sᵢ with normalised rewards A⁺ᵢ, A⁻ᵢ:
+  Δθ += (α/N) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
+Applied via WorkerExtension.perturb_self_weights(seed, coeff) on engine 0,
+then NCCL-broadcast to all engines.
 """
 
+import argparse
+from datetime import datetime
+import gc
 import os
 import re
-import sys
-import json
-import copy
-import time
 import random
-import logging
-import argparse
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple, Any
-from pathlib import Path
+import shutil
+import signal
+import sys
+import time
 
 import numpy as np
+import pandas as pd
+import ray
+from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 import torch
-import torch.nn.functional as F
-from torch.optim import AdamW
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    set_seed,
-)
-from peft import get_peft_model, LoraConfig, TaskType
+from torch.utils.tensorboard import SummaryWriter
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
+from vllm.utils import get_ip, get_open_port
+
+from deepscaler import compute_score, SYSTEM_PROMPT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging
+# Default hyperparameters
 # ─────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    level=logging.INFO,
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger(__name__)
-
-
-def banner(title: str, width: int = 80, char: str = "═") -> str:
-    pad = max(0, width - len(title) - 4)
-    return f"\n{char * 2}  {title}  {char * pad}"
-
-
-def rule(width: int = 80, char: str = "─") -> str:
-    return char * width
+SIGMA            = 0.001          # perturbation scale σ
+ALPHA            = 0.0005         # ES learning rate α
+POPULATION_SIZE  = 20             # number of perturbations per iteration
+NUM_ENGINES      = 4              # parallel vLLM engines (= GPUs)
+NUM_ITERATIONS   = 200
+ENTROPY_COEFF    = 0.001          # matches OneShot-RLVR actor.entropy_coeff
+VAL_EVERY        = 10             # evaluate on math500 every N iterations
+EXPERIMENT_DIR   = "outputs/es_rlvr_oneshot"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuration
+# Argument parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass
-class Config:
-    # ── Model ───────────────────────────────────────────────────────────────
-    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-
-    # ── LoRA (adapters only are perturbed / optimised) ───────────────────────
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="ES-RLVR: One-Shot-RLVR methodology in a vLLM+Ray+NCCL ES loop"
     )
+    # Model
+    parser.add_argument("--model_name", type=str,
+                        default="Qwen/Qwen2.5-Math-1.5B-Instruct")
+    # Data
+    parser.add_argument("--parquet_path", type=str,
+                        default="Dataset parquet/pi1_r128.parquet",
+                        help="Train parquet (verl schema). One-shot: pi1_r128.")
+    parser.add_argument("--val_parquet_path", type=str,
+                        default="Dataset parquet/math500.parquet",
+                        help="Validation parquet (verl schema). math500.")
+    parser.add_argument("--val_batch_size", type=int, default=50,
+                        help="Number of val examples to evaluate each val step.")
+    # ES
+    parser.add_argument("--sigma", type=float, default=SIGMA)
+    parser.add_argument("--alpha", type=float, default=ALPHA)
+    parser.add_argument("--population_size", type=int, default=POPULATION_SIZE)
+    parser.add_argument("--antithetic", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Use antithetic (±ε) pairs (default: True).")
+    parser.add_argument("--iid_noise", action="store_true", default=False,
+                        help="Independent noise per parameter (vs shared noise).")
+    # Reward
+    parser.add_argument("--entropy_coeff", type=float, default=ENTROPY_COEFF,
+                        help="Entropy bonus coefficient (One-Shot-RLVR: 0.001).")
+    # Training
+    parser.add_argument("--num_engines", type=int, default=NUM_ENGINES)
+    parser.add_argument("--num_iterations", type=int, default=NUM_ITERATIONS)
+    parser.add_argument("--val_every", type=int, default=VAL_EVERY)
+    parser.add_argument("--experiment_dir", type=str, default=EXPERIMENT_DIR)
+    parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
+    parser.add_argument("--global_seed", type=int, default=None)
+    parser.add_argument("--verbose", action="store_true")
 
-    # ── ES hyperparameters ───────────────────────────────────────────────────
-    # antithetic pairs  →  2 * n_pairs total perturbations per step
-    n_pairs: int = 5
-    # perturbation scale σ  (small to stay near current policy)
-    sigma: float = 0.005
-    # G: rollouts generated per prompt per perturbation
-    rollouts_per_perturbation: int = 4
+    args = parser.parse_args()
 
-    # ── One-Shot data (OneShot-RLVR faithful) ───────────────────────────────
-    n_training_examples: int = 1      # number of unique training examples
-    batch_repeat: int = 1             # times each example is duplicated per step
-    #   (in practice the ES population itself acts as the "batch repeat")
-    n_probe_runs: int = 8             # probe rollouts per example for variance scoring
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
 
-    # ── Generation ──────────────────────────────────────────────────────────
-    max_prompt_length: int = 512
-    max_new_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
+    if args.global_seed is not None:
+        random.seed(args.global_seed)
+        np.random.seed(args.global_seed)
+        torch.manual_seed(args.global_seed)
+        torch.cuda.manual_seed_all(args.global_seed)
 
-    # ── Reward ──────────────────────────────────────────────────────────────
-    # OneShot-RLVR: binary correctness ONLY — no format reward
-    reward_correct: float = 1.0
-    reward_incorrect: float = 0.0
-
-    # ── Regularisation (separate from ES reward signal) ─────────────────────
-    # Matches OneShot-RLVR actor.entropy_coeff and actor.kl_loss_coeff
-    entropy_coeff: float = 0.001
-    kl_coeff: float = 0.001
-
-    # ── Optimiser ───────────────────────────────────────────────────────────
-    lr: float = 1e-6
-    weight_decay: float = 0.0
-    max_grad_norm: float = 1.0
-
-    # ── Training loop ────────────────────────────────────────────────────────
-    total_steps: int = 500
-    eval_every: int = 25
-    log_every: int = 5
-    save_every: int = 100
-    n_display_samples: int = 2        # how many outputs to print each log step
-
-    # ── Paths ────────────────────────────────────────────────────────────────
-    data_path: str = "Dataset parquet/pi1_r128.parquet"
-    val_data_path: Optional[str] = "Dataset parquet/math500.parquet"
-    output_dir: str = "./es_rlvr_output"
-
-    # ── Reproducibility ──────────────────────────────────────────────────────
-    seed: int = 42
+    return args
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reward  — delegate entirely to deepscaler.compute_score()
-# ─────────────────────────────────────────────────────────────────────────────
-# deepscaler.py (in this repo) is the authoritative reward implementation.
-# It mirrors verl/utils/reward_score/deepscaler.py exactly:
-#   - Extract \boxed{} answer from response
-#   - Return 1.0 if correct via grade_answer_mathd / grade_answer_sympy
-#   - Return 0.0 otherwise  (no format reward, no partial credit)
+# vLLM engine setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-from deepscaler import compute_score as _deepscaler_compute_score, SYSTEM_PROMPT  # noqa: E402
+class ESNcclLLM(LLM):
+    """LLM subclass that disables CUDA_VISIBLE_DEVICES and V1 multiprocessing
+    before initialising vLLM, required for multi-engine Ray deployment."""
+
+    def __init__(self, *args, **kwargs):
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        super().__init__(*args, **kwargs)
 
 
-def extract_answer(text: str) -> Optional[str]:
-    """Extract last \\boxed{} from text — used only for display, not grading."""
-    pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
-    matches = re.findall(pattern, text)
+def launch_engines(num_engines: int, model_path: str):
+    """
+    Allocate one Ray placement group (1 GPU) per engine, launch ESNcclLLM
+    actors with WorkerExtension for in-GPU ES perturbations.
+    """
+    pgs = [
+        placement_group([{"GPU": 1, "CPU": 0}], lifetime="detached")
+        for _ in range(num_engines)
+    ]
+    ray.get([pg.ready() for pg in pgs])
+
+    strategies = [
+        PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=0,
+        )
+        for pg in pgs
+    ]
+
+    engines = [
+        ray.remote(
+            num_cpus=0, num_gpus=0, scheduling_strategy=strategy
+        )(ESNcclLLM).remote(
+            model=model_path,
+            tensor_parallel_size=1,
+            distributed_executor_backend="ray",
+            worker_extension_cls="utils.worker_extn.WorkerExtension",
+            dtype="float16",
+            enable_prefix_caching=False,
+            enforce_eager=False,
+        )
+        for strategy in strategies
+    ]
+    return engines, pgs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data loading  (verl parquet schema)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_task_datas(parquet_path: str, tokenizer) -> list:
+    """
+    Load a verl-schema parquet file.
+
+    Expected columns:
+      prompt        — list of chat dicts [{role, content}, ...]
+      reward_model  — dict with key "ground_truth"
+      data_source   — string label
+
+    Returns list of dicts with keys:
+      prompt_str    — full formatted prompt (system + chat + generation header)
+      ground_truth  — string answer for grading
+      data_source   — dataset label
+    """
+    if not os.path.exists(parquet_path):
+        raise FileNotFoundError(
+            f"Parquet not found: {parquet_path}\n"
+            "Pass the correct path via --parquet_path / --val_parquet_path"
+        )
+    df = pd.read_parquet(parquet_path)
+    if len(df) == 0:
+        raise RuntimeError(f"Parquet has zero rows: {parquet_path}")
+
+    task_datas = []
+    for _, row in df.iterrows():
+        chat = list(row["prompt"])
+        reward_model = row["reward_model"]
+        gt = reward_model["ground_truth"] if isinstance(reward_model, dict) else str(reward_model)
+        ds = str(row.get("data_source", "deepscaler"))
+        # Prepend system prompt — matching es_fine_tuning_deepscaler_accl.py
+        chat_with_system = [{"role": "system", "content": SYSTEM_PROMPT}] + chat
+        prompt_str = tokenizer.apply_chat_template(
+            chat_with_system, tokenize=False, add_generation_prompt=True
+        )
+        task_datas.append({
+            "prompt_str":   prompt_str,
+            "ground_truth": str(gt),
+            "data_source":  ds,
+        })
+    return task_datas
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
+                    max_tokens: int = 2048):
+    """
+    Launch an async vLLM generation on llm.
+    logprobs=1 → per-token logprob of the sampled token, used as entropy proxy.
+    Returns (object_ref, start_timestamp).
+    """
+    prompts = [d["prompt_str"] for d in task_datas]
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        seed=42,
+        max_tokens=max_tokens,
+        logprobs=1,          # entropy proxy: −mean(log p_chosen)
+    )
+    handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
+    return handle, time.time()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reward computation  (One-Shot-RLVR faithful)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_boxed(text: str):
+    """Extract last \\boxed{} content — used for display only."""
+    matches = re.findall(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}", text or "")
     return matches[-1].strip() if matches else None
 
 
-def compute_reward(response: str, ground_truth: str,
-                   data_source: str = "deepscaler") -> float:
+def _entropy_proxy(output_obj) -> float:
     """
-    Thin wrapper around deepscaler.compute_score().
+    Per-token entropy proxy from vLLM logprobs=1.
 
-    Passes use_think=False (no <think>...</think> stripping) matching
-    the OneShot-RLVR training setup.  Returns 1.0 or 0.0 — binary only.
+    vLLM returns the logprob of the sampled token at each step.
+    entropy_proxy = −mean(log p_chosen)  over response tokens.
+
+    This equals the average per-token NLL (negative log-likelihood) under
+    the sampling policy — a tractable proxy for true Shannon entropy.
+    Higher value → model more uncertain / exploratory.
+
+    Note: True H(π) = −Σ_v π(v) log π(v) requires full-vocabulary
+    logprobs.  We use this proxy because vLLM exposes only top-k logprobs.
+    The qualitative gradient direction is the same: maximising this proxy
+    encourages higher-entropy (more diverse) responses.
     """
-    return float(_deepscaler_compute_score(
-        data_source=data_source,
-        solution_str=response,
-        ground_truth=ground_truth,
-        extra_info=None,
-        use_think=False,
-    ))
+    completion = output_obj.outputs[0]
+    if not completion.logprobs:
+        return 0.0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data utilities
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_dataset(path: str) -> List[Dict]:
-    """
-    Load a dataset in verl parquet format (the schema used by pi1_r128 and
-    math500 in this repo) or plain JSON/JSONL.
-
-    Verl parquet schema (columns):
-      prompt       — list of chat dicts, e.g. [{"role": "user", "content": "…"}]
-      reward_model — dict with key "ground_truth"
-      data_source  — string, e.g. "deepscaler" or "simplerl/math500"
-
-    Each returned record has:
-      "chat"          : the raw prompt list (to be formatted with apply_chat_template)
-      "ground_truth"  : string answer
-      "data_source"   : string
-    """
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(
-            f"Dataset not found: {path}\n"
-            f"Pass the correct path via --data_path"
+    chosen_lps = []
+    for lp_dict in completion.logprobs:
+        if not lp_dict:
+            continue
+        lp_val = next(iter(lp_dict.values()))
+        # vLLM Logprob object exposes .logprob; fall back to float() for
+        # older versions that return a plain number.
+        chosen_lps.append(
+            lp_val.logprob if hasattr(lp_val, "logprob") else float(lp_val)
         )
 
-    if p.suffix == ".parquet":
-        try:
-            import pandas as pd  # type: ignore
-        except ImportError:
-            raise ImportError("pip install pandas pyarrow")
-        df = pd.read_parquet(p)
-        data = []
-        for _, row in df.iterrows():
-            rm = row["reward_model"]
-            gt = rm["ground_truth"] if isinstance(rm, dict) else str(rm)
-            data.append({
-                "chat":         list(row["prompt"]),
-                "ground_truth": str(gt),
-                "data_source":  str(row.get("data_source", "deepscaler")),
-            })
-    elif p.suffix == ".jsonl":
-        with open(p) as f:
-            data = [json.loads(line) for line in f if line.strip()]
-    else:
-        with open(p) as f:
-            data = json.load(f)
-
-    log.info(f"Loaded {len(data)} examples from {path}")
-    return data
+    return float(-np.mean(chosen_lps)) if chosen_lps else 0.0
 
 
-def _format_prompt(item: Dict, tokenizer) -> str:
+def _postprocess_outputs(outputs, task_datas: list,
+                         entropy_coeff: float = 0.0,
+                         debug_print: bool = False) -> dict:
     """
-    Build the full prompt string from a verl-format record.
-    Prepends SYSTEM_PROMPT (from deepscaler.py) then applies the chat template,
-    matching es_fine_tuning_deepscaler_accl.py exactly.
+    Compute per-sample total rewards.
+
+    One-Shot-RLVR reward design:
+      binary_reward = compute_score(...)              → 1.0 or 0.0
+      entropy_bonus = entropy_coeff × entropy_proxy   → exploratory signal
+      total         = binary_reward + entropy_bonus
+
+    KL penalty is omitted (see module docstring).
+
+    Returns:
+      scores          — list of total rewards (used for GRPO/ES normalisation)
+      correctness_scores — list of binary rewards (for logging)
+      avg_reward      — mean total reward across batch
+      avg_correctness — mean binary correctness across batch
+      avg_entropy     — mean entropy proxy across batch
     """
-    chat_with_system = [{"role": "system", "content": SYSTEM_PROMPT}] + item["chat"]
-    return tokenizer.apply_chat_template(
-        chat_with_system, tokenize=False, add_generation_prompt=True
-    )
+    correctness_scores = []
+    total_scores = []
+    entropy_vals = []
 
+    for idx, (output, data) in enumerate(zip(outputs, task_datas)):
+        completion = output.outputs[0].text
+        binary_reward = float(compute_score(
+            data_source=data.get("data_source", "deepscaler"),
+            solution_str=completion,
+            ground_truth=data["ground_truth"],
+            extra_info=None,
+            use_think=False,
+        ))
+        ent = _entropy_proxy(output)
+        total = binary_reward + entropy_coeff * ent
 
-@torch.no_grad()
-def select_high_variance_examples(
-    dataset: List[Dict],
-    model,
-    tokenizer,
-    cfg: Config,
-    n_select: int = 1,
-) -> List[Dict]:
-    """
-    Select training examples with the highest accuracy variance ('std' method).
+        correctness_scores.append(binary_reward)
+        entropy_vals.append(ent)
+        total_scores.append(total)
 
-    Adapted from OneShot-RLVR data/data_selection.py acc_score(method='std'):
-      variance_score(i) = std( probe_accuracy_over_runs(i) )
+        if debug_print and idx == 0:
+            tail = completion[-600:] if len(completion) > 600 else completion
+            boxed = _extract_boxed(completion)
+            print("\n" + "=" * 70)
+            print("[TRAIN OUTPUT] Sample response:")
+            print(f"  Ground Truth    : {data['ground_truth']}")
+            print(f"  Extracted Answer: {boxed if boxed else '(none — no \\boxed{})'}")
+            print(f"  Correctness     : {binary_reward}")
+            print(f"  Entropy Proxy   : {ent:.4f}")
+            if entropy_coeff > 0.0:
+                print(f"  Entropy Bonus   : {entropy_coeff * ent:.6f}")
+                print(f"  Total Reward    : {total:.4f}")
+            print(f"  Response (tail) :\n    ...{tail}")
+            print("=" * 70 + "\n")
 
-    Deduplicates by ground_truth first — pi1_r128 contains 128 identical rows,
-    so probing every row would be wasteful.  Only unique questions are scored.
-    """
-    # Deduplicate by (chat content, ground_truth) so pi1_r128's 128 copies
-    # collapse to 1 unique example without skipping genuine diversity.
-    seen: set = set()
-    unique: List[Dict] = []
-    for item in dataset:
-        key = (str(item["chat"]), item["ground_truth"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-
-    if len(unique) == 1:
-        # Already a single unique example — no probing needed.
-        log.info(f"  Dataset has 1 unique example — skipping variance probe.")
-        q_preview = str(unique[0]["chat"])[:100]
-        log.info(f"  Training example: {q_preview}…")
-        return unique[:n_select]
-
-    pool = unique[: min(100, len(unique))]
-    log.info(
-        f"Scoring {len(pool)} unique candidates for variance "
-        f"({cfg.n_probe_runs} probe runs each)…"
-    )
-
-    model.eval()
-    device = next(model.parameters()).device
-    variances = []
-
-    for idx, item in enumerate(pool):
-        prompt = _format_prompt(item, tokenizer)
-        enc = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=cfg.max_prompt_length,
-        ).to(device)
-
-        scores = []
-        for _ in range(cfg.n_probe_runs):
-            try:
-                out = model.generate(
-                    **enc,
-                    max_new_tokens=min(128, cfg.max_new_tokens),
-                    temperature=cfg.temperature,
-                    top_p=cfg.top_p,
-                    do_sample=True,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-                resp = tokenizer.decode(
-                    out[0][enc.input_ids.shape[1]:], skip_special_tokens=True
-                )
-                scores.append(compute_reward(resp, item["ground_truth"],
-                                             item.get("data_source", "deepscaler")))
-            except Exception:
-                scores.append(0.0)
-
-        var = float(np.var(scores))
-        mean_acc = float(np.mean(scores))
-        variances.append((idx, var, mean_acc))
-
-        if (idx + 1) % 20 == 0:
-            log.info(f"  Probed {idx + 1}/{len(pool)}…")
-
-    variances.sort(key=lambda x: x[1], reverse=True)
-
-    selected = []
-    for rank, (idx, var, mean_acc) in enumerate(variances[:n_select]):
-        q_preview = str(pool[idx]["chat"])[:80]
-        log.info(
-            f"  Selected #{rank + 1}: idx={idx}  var={var:.3f}  "
-            f"mean_acc={mean_acc:.2f}  Q: {q_preview}…"
-        )
-        selected.append(pool[idx])
-
-    return selected
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LoRA parameter helpers for ES perturbation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_lora_params(model) -> Dict[str, torch.nn.Parameter]:
-    """Return the trainable LoRA adapter parameters (lora_A / lora_B tensors)."""
     return {
-        name: param
-        for name, param in model.named_parameters()
-        if param.requires_grad and ("lora_A" in name or "lora_B" in name)
+        "scores":             total_scores,
+        "correctness_scores": correctness_scores,
+        "avg_reward":         float(np.mean(total_scores))       if total_scores else 0.0,
+        "avg_correctness":    float(np.mean(correctness_scores)) if correctness_scores else 0.0,
+        "avg_entropy":        float(np.mean(entropy_vals))       if entropy_vals else 0.0,
     }
 
 
-def sample_noise(
-    lora_params: Dict[str, torch.nn.Parameter]
-) -> Dict[str, torch.Tensor]:
-    """Draw i.i.d. N(0,1) noise matching each LoRA parameter's shape."""
-    return {name: torch.randn_like(p.data) for name, p in lora_params.items()}
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation
+# ─────────────────────────────────────────────────────────────────────────────
 
+def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
+                     iteration: int, writer, verbose: bool = False) -> float:
+    """
+    On-the-go greedy evaluation on math500 (or any val set).
 
-@torch.no_grad()
-def apply_perturbation(
-    lora_params: Dict[str, torch.nn.Parameter],
-    noise: Dict[str, torch.Tensor],
-    sigma: float,
-    sign: float,
-) -> None:
-    """In-place: param += sign * sigma * noise for every LoRA tensor."""
-    for name, param in lora_params.items():
-        param.data.add_(sign * sigma * noise[name])
+    Uses engine 0, which holds the current best weights after each ES update
+    and NCCL broadcast.  Greedy decoding (temperature=0) for deterministic
+    accuracy.
+    """
+    batch = val_task_datas[:val_batch_size]
+    prompts = [d["prompt_str"] for d in batch]
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
+
+    print(f"\n[VAL] Iter {iteration}: evaluating {len(batch)} examples (greedy)...")
+    outputs = ray.get(engine.generate.remote(prompts, sampling_params, use_tqdm=False))
+
+    correct = 0.0
+    for output, data in zip(outputs, batch):
+        correct += float(compute_score(
+            data_source=data.get("data_source", "deepscaler"),
+            solution_str=output.outputs[0].text,
+            ground_truth=data["ground_truth"],
+            use_think=False,
+        ))
+
+    accuracy = correct / len(batch)
+    print(f"[VAL] accuracy = {accuracy:.4f}  ({int(correct)}/{len(batch)})")
+
+    if verbose and outputs:
+        completion = outputs[0].outputs[0].text
+        tail = completion[-400:] if len(completion) > 400 else completion
+        boxed = _extract_boxed(completion)
+        print(f"\n[VAL SAMPLE]  gt={batch[0]['ground_truth']}"
+              f"  pred={boxed if boxed else '(none)'}")
+        print(f"  ...{tail}\n")
+
+    if writer is not None:
+        writer.add_scalar("val/accuracy", accuracy, iteration)
+    return accuracy
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Generation
+# Main training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-@torch.no_grad()
-def generate_batch(
-    model,
-    tokenizer,
-    prompts: List[str],
-    cfg: Config,
-) -> List[str]:
-    """
-    Generate one response per prompt (sequential to keep peak memory low).
-    Returns empty string on generation error — reward will be 0.
-    """
-    device = next(model.parameters()).device
-    responses = []
+def main(args):
+    # Clear any stale Ray environment variables
+    os.environ.pop("RAY_ADDRESS", None)
+    os.environ.pop("RAY_HEAD_IP", None)
+    os.environ.pop("RAY_GCS_SERVER_ADDRESS", None)
+    ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
 
-    for prompt in prompts:
-        enc = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=cfg.max_prompt_length,
-            padding=False,
-        ).to(device)
+    # ── Logging ───────────────────────────────────────────────────────────────
+    run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logging_dir = f"{args.experiment_dir}/run_{run_tag}"
+    writer = SummaryWriter(log_dir=logging_dir)
+    model_saves_dir = f"{logging_dir}/model_saves"
+    os.makedirs(model_saves_dir, exist_ok=True)
 
-        try:
-            out = model.generate(
-                **enc,
-                max_new_tokens=cfg.max_new_tokens,
-                temperature=cfg.temperature,
-                top_p=cfg.top_p,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-            text = tokenizer.decode(
-                out[0][enc.input_ids.shape[1] :], skip_special_tokens=True
-            )
-        except Exception as e:
-            log.debug(f"Generation error: {e}")
-            text = ""
+    # ── Tokenizer + base model snapshot ──────────────────────────────────────
+    # vLLM needs an HF checkpoint directory; we save the base model once and
+    # point all engines at it.  The model stays on CPU during this step.
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-        responses.append(text)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        args.model_name, torch_dtype=torch.float16
+    ).to("cpu")
+    base_model_path = f"{model_saves_dir}/base_model"
+    if os.path.exists(base_model_path):
+        shutil.rmtree(base_model_path)
+    os.makedirs(base_model_path, exist_ok=True)
+    tokenizer.save_pretrained(base_model_path)
+    base_model.save_pretrained(base_model_path)
+    del base_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    return responses
+    # ── Load data ─────────────────────────────────────────────────────────────
+    print(f"\n[DATA] Loading train: {args.parquet_path}")
+    train_task_datas = load_task_datas(args.parquet_path, tokenizer)
+    print(f"[DATA] {len(train_task_datas)} train examples loaded.")
 
+    val_task_datas = None
+    if args.val_parquet_path and os.path.exists(args.val_parquet_path):
+        print(f"[DATA] Loading val:   {args.val_parquet_path}")
+        val_task_datas = load_task_datas(args.val_parquet_path, tokenizer)
+        print(f"[DATA] {len(val_task_datas)} val examples loaded.")
+    else:
+        print(f"[DATA] Val path not found ({args.val_parquet_path}), "
+              f"skipping validation.")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GRPO advantage normalisation  (OneShot-RLVR core_algos.py faithful)
-# ─────────────────────────────────────────────────────────────────────────────
+    # ── Launch engines ────────────────────────────────────────────────────────
+    print(f"\n[ENGINES] Launching {args.num_engines} vLLM engines...")
+    engines, pgs = launch_engines(args.num_engines, base_model_path)
 
-def compute_grpo_advantages(rewards: List[float], eps: float = 1e-6) -> List[float]:
-    """
-    Group Relative Policy Optimisation outcome advantage.
-
-    Direct port of OneShot-RLVR verl/trainer/ppo/core_algos.py
-    compute_grpo_outcome_advantage():
-      - If only 1 sample → advantage = 0  (no within-group comparison possible)
-      - If std < eps     → advantage = 0  (all rewards identical, no signal)
-      - Otherwise        → A = (r - mean) / (std + eps)
-    """
-    if len(rewards) <= 1:
-        return [0.0] * len(rewards)
-
-    r = torch.tensor(rewards, dtype=torch.float32)
-    std = r.std()
-
-    if std.item() < eps:
-        # All responses equally good/bad — zero advantage, no gradient signal.
-        return [0.0] * len(rewards)
-
-    advantages = (r - r.mean()) / (std + eps)
-    return advantages.tolist()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entropy & KL  (white-box, separate from ES reward — verl faithful)
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# verl reference:  verl/trainer/ppo/core_algos.py
-#
-#   def compute_entropy_loss(logits, eos_mask):
-#       entropy = verl_F.entropy_from_logits(logits)   # response logits only
-#       entropy_loss = verl_F.masked_mean(entropy, mask=eos_mask)
-#       return entropy_loss
-#
-# Two things the original script got wrong that are fixed here:
-#   1. Scope  — verl operates on response-only logits, not the full sequence.
-#               Prompt tokens must be stripped before computing entropy / KL.
-#   2. eos_mask — verl uses masked_mean with a binary mask that is 1 for every
-#               response token up to and including the first EOS, then 0.
-#               Plain .mean() over all positions (including post-EOS padding)
-#               dilutes the signal and does not match verl.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _build_eos_mask(response_ids: torch.Tensor, eos_token_id: int) -> torch.Tensor:
-    """
-    Build the eos_mask used by verl.masked_mean.
-
-    mask[t] = 1  for all response token positions t up to and including
-                 the first EOS token (EOS itself counts as a valid step).
-    mask[t] = 0  for all positions strictly after the first EOS.
-
-    If no EOS is present the entire response is considered valid (all 1s).
-
-    Parameters
-    ----------
-    response_ids   : (R,) int tensor — token ids for the response portion only
-    eos_token_id   : the EOS token id from the tokenizer
-    """
-    eos_positions = (response_ids == eos_token_id).nonzero(as_tuple=True)[0]
-    if len(eos_positions) == 0:
-        return torch.ones(len(response_ids), dtype=torch.float32,
-                          device=response_ids.device)
-    first_eos = int(eos_positions[0].item())
-    mask = torch.zeros(len(response_ids), dtype=torch.float32,
-                       device=response_ids.device)
-    mask[: first_eos + 1] = 1.0   # include EOS position
-    return mask
-
-
-def _masked_mean(values: torch.Tensor, mask: torch.Tensor,
-                 eps: float = 1e-8) -> torch.Tensor:
-    """
-    verl_F.masked_mean: weighted mean where mask selects valid positions.
-    values, mask: (R,) — response-length tensors.
-    """
-    return (values * mask).sum() / (mask.sum() + eps)
-
-
-def _entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
-    """
-    verl_F.entropy_from_logits.
-    Numerically stable categorical entropy from raw logits.
-
-    H(t) = -Σ_v  softmax(logits_t)_v * log_softmax(logits_t)_v
-
-    Using F.log_softmax (which internally applies the log-sum-exp trick)
-    avoids underflow for large-magnitude logits, matching verl's stable path.
-
-    Parameters
-    ----------
-    logits : (R, V) — response-position logits
-    Returns
-    -------
-    entropy : (R,) — per-token entropy
-    """
-    log_probs = F.log_softmax(logits, dim=-1)   # (R, V)
-    entropy = -(log_probs.exp() * log_probs).sum(dim=-1)  # (R,)
-    return entropy
-
-
-def _encode_prompt_and_full(
-    tokenizer,
-    prompt: str,
-    response: str,
-    max_prompt_len: int,
-    max_full_len: int,
-    device: torch.device,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, int]]:
-    """
-    Tokenise prompt alone and prompt+response together.
-
-    Returns
-    -------
-    full_ids    : (1, T) token ids for the full sequence
-    response_ids: (R,)  token ids for the response portion only
-    prompt_len  : number of tokens in the prompt
-
-    Returns None when the response is empty (nothing to compute over).
-    """
-    prompt_ids = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_prompt_len,
-        add_special_tokens=True,
-    ).input_ids.to(device)
-    prompt_len = int(prompt_ids.shape[1])
-
-    full_enc = tokenizer(
-        prompt + response,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_full_len,
-        add_special_tokens=True,
-    ).to(device)
-    full_ids = full_enc.input_ids   # (1, T)
-    T = int(full_ids.shape[1])
-
-    if T <= prompt_len:
-        return None   # response was truncated away entirely
-
-    response_ids = full_ids[0, prompt_len:]   # (R,)
-    return full_ids, full_enc, response_ids, prompt_len
-
-
-def compute_entropy_loss(
-    model,
-    tokenizer,
-    prompt_response_pairs: List[Tuple[str, str]],
-    device: torch.device,
-    max_prompt_len: int,
-    max_full_len: int,
-) -> torch.Tensor:
-    """
-    Token-level entropy bonus — verl faithful.
-
-    verl core_algos.py:
-        entropy = verl_F.entropy_from_logits(logits)   # response logits only
-        entropy_loss = verl_F.masked_mean(entropy, mask=eos_mask)
-
-    Steps (matching verl exactly):
-      1. Slice to response-only logits   (strip prompt positions)
-      2. Compute entropy_from_logits     (numerically stable)
-      3. Build eos_mask                  (1 up to first EOS, 0 after)
-      4. masked_mean                     (only valid response tokens count)
-      5. Return -mean(entropy)           (minimise to maximise H)
-
-    Parameters
-    ----------
-    prompt_response_pairs : list of (prompt_str, response_str) tuples
-    """
-    entropy_vals: List[torch.Tensor] = []
-
-    for prompt, response in prompt_response_pairs[:4]:
-        result = _encode_prompt_and_full(
-            tokenizer, prompt, response,
-            max_prompt_len, max_full_len, device,
+    # ── NCCL inter-engine communicator ────────────────────────────────────────
+    master_address = get_ip()
+    master_port    = get_open_port()
+    print(f"[NCCL] Init inter-engine group at {master_address}:{master_port}")
+    ray.get([
+        engines[i].collective_rpc.remote(
+            "init_inter_engine_group",
+            args=(master_address, master_port, i, args.num_engines),
         )
-        if result is None:
-            continue
-        full_ids, full_enc, response_ids, prompt_len = result
-        T = int(full_ids.shape[1])
-        R = int(response_ids.shape[0])
+        for i in range(args.num_engines)
+    ])
+    print("[NCCL] Ready.\n")
 
-        # Forward pass — gradients flow through response logits only
-        with torch.enable_grad():
-            all_logits = model(**full_enc).logits  # (1, T, V)
+    # ── Signal handlers for clean shutdown ────────────────────────────────────
+    def cleanup():
+        for llm in engines:
+            try:
+                ray.kill(llm)
+            except Exception:
+                pass
+        for pg in pgs:
+            try:
+                remove_placement_group(pg)
+            except Exception:
+                pass
+        ray.shutdown()
 
-        # Response logits: position (prompt_len-1) predicts token at prompt_len,
-        # position (T-2) predicts token at T-1 — so slice [prompt_len-1 : T-1].
-        response_logits = all_logits[0, prompt_len - 1: T - 1, :]  # (R, V)
+    def sig_handler(sig, frame):
+        cleanup()
+        sys.exit(0)
 
-        # verl_F.entropy_from_logits
-        entropy = _entropy_from_logits(response_logits)   # (R,)
+    signal.signal(signal.SIGINT,  sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
 
-        # verl eos_mask  +  verl_F.masked_mean
-        eos_mask = _build_eos_mask(response_ids, tokenizer.eos_token_id)
-        entropy_vals.append(_masked_mean(entropy, eos_mask))
+    # ── Config summary ────────────────────────────────────────────────────────
+    print("=" * 70)
+    print("  ES-RLVR: One-Shot-RLVR + vLLM + Ray + NCCL")
+    print("=" * 70)
+    print(f"  Model          : {args.model_name}")
+    print(f"  Population     : {args.population_size}"
+          f"  ({'antithetic ±ε pairs' if args.antithetic else 'standard'})")
+    print(f"  σ (sigma)      : {args.sigma}")
+    print(f"  α (alpha)      : {args.alpha}")
+    print(f"  Entropy coeff  : {args.entropy_coeff}")
+    print(f"  Engines (GPUs) : {args.num_engines}")
+    print(f"  Iterations     : {args.num_iterations}")
+    print(f"  Train examples : {len(train_task_datas)}")
+    print(f"  Val examples   : {len(val_task_datas) if val_task_datas else 'N/A'}")
+    print(f"  Val every      : {args.val_every} iters")
+    print(f"  Log dir        : {logging_dir}")
+    print("=" * 70 + "\n")
 
-    if not entropy_vals:
-        return torch.tensor(0.0, device=device)
+    # ──────────────────────────────────────────────────────────────────────────
+    # Training loop
+    # ──────────────────────────────────────────────────────────────────────────
+    for i in range(args.num_iterations):
+        print(f"\n{'─' * 50}")
+        print(f"  Generation {i} / {args.num_iterations - 1}")
+        print(f"{'─' * 50}")
+        total_iter_start = time.time()
 
-    # Negate: minimising -H(π) maximises entropy (exploration bonus)
-    return -torch.stack(entropy_vals).mean()
-
-
-def compute_kl_loss(
-    model,
-    ref_model,
-    tokenizer,
-    prompt_response_pairs: List[Tuple[str, str]],
-    device: torch.device,
-    max_prompt_len: int,
-    max_full_len: int,
-) -> torch.Tensor:
-    """
-    Low-variance KL divergence against the frozen reference model — verl faithful.
-
-    verl core_algos.py kl_penalty('low_var_kl'):
-        kl  = ref_logprob - logprob          # log(π_ref / π)
-        kld = exp(kl) - kl - 1              # Schulman 2020 low-var approx
-        kld = clamp(kld, -10, 10)
-
-    Applied with eos_mask + masked_mean over response tokens only,
-    matching the same scoping rule used for entropy above.
-    """
-    kl_vals: List[torch.Tensor] = []
-
-    for prompt, response in prompt_response_pairs[:4]:
-        result = _encode_prompt_and_full(
-            tokenizer, prompt, response,
-            max_prompt_len, max_full_len, device,
-        )
-        if result is None:
-            continue
-        full_ids, full_enc, response_ids, prompt_len = result
-        T = int(full_ids.shape[1])
-
-        # Actor logits (grad flows through these)
-        with torch.enable_grad():
-            all_logits = model(**full_enc).logits        # (1, T, V)
-
-        # Reference logits (frozen, no grad)
-        with torch.no_grad():
-            ref_all_logits = ref_model(**full_enc).logits  # (1, T, V)
-
-        # Slice to response positions only
-        resp_logits     = all_logits[0, prompt_len - 1: T - 1, :]      # (R, V)
-        resp_ref_logits = ref_all_logits[0, prompt_len - 1: T - 1, :]  # (R, V)
-
-        log_p   = F.log_softmax(resp_logits, dim=-1)              # (R, V)
-        log_ref = F.log_softmax(resp_ref_logits, dim=-1).detach() # (R, V)
-
-        # low_var_kl per token, summed over vocab then masked over time
-        kl_per_token_vocab = log_ref - log_p                      # (R, V)
-        ratio = torch.exp(kl_per_token_vocab)
-        kld_vocab = ratio - kl_per_token_vocab - 1                # (R, V)
-        kld = kld_vocab.sum(dim=-1)                               # (R,)
-        kld = kld.clamp(-10, 10)                                  # verl clip
-
-        eos_mask = _build_eos_mask(response_ids, tokenizer.eos_token_id)
-        kl_vals.append(_masked_mean(kld, eos_mask))
-
-    if not kl_vals:
-        return torch.tensor(0.0, device=device)
-
-    return torch.stack(kl_vals).mean()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Display utilities
-# ─────────────────────────────────────────────────────────────────────────────
-
-def display_training_samples(
-    prompts: List[str],
-    responses: List[str],
-    rewards: List[float],
-    advantages: List[float],
-    step: int,
-    n_show: int = 2,
-) -> None:
-    """
-    Print a selection of model outputs alongside their rewards and advantages.
-    Shows one correct and one incorrect response when both exist.
-    """
-    print(banner(f"STEP {step}  —  Training Outputs", char="═"))
-
-    paired = list(zip(prompts, responses, rewards, advantages))
-    correct   = [p for p in paired if p[2] > 0.5]
-    incorrect = [p for p in paired if p[2] <= 0.5]
-
-    show: List[Tuple] = []
-    if correct:
-        show.append(correct[0])
-    if incorrect:
-        show.append(incorrect[0])
-    if not show:
-        show = paired[:n_show]
-    show = show[:n_show]
-
-    for i, (prompt, response, reward, adv) in enumerate(show):
-        p_tail = ("…" + prompt[-180:]) if len(prompt) > 180 else prompt
-        r_disp = (response[:500] + "…") if len(response) > 500 else response
-        ans = extract_answer(response)
-
-        label = "✓ CORRECT" if reward > 0.5 else "✗ WRONG"
-        print(f"\n  [{i + 1}]  {label}  |  reward={reward:.1f}  adv={adv:+.3f}")
-        print(f"  Prompt (tail) ▸ {p_tail.strip()}")
-        print(f"  Response      ▸ {r_disp.strip()}")
-        print(f"  Extracted     ▸ {ans!r}")
-
-    print(rule())
-
-
-def display_eval_results(results: Dict[str, Any], step: int) -> None:
-    print(banner(f"EVAL @ step {step}", char="═"))
-    for key, val in results.items():
-        if isinstance(val, float):
-            print(f"  {key:<40s} {val:.4f}")
+        # ── Build seed list for this generation ───────────────────────────────
+        # Antithetic pairs: N/2 seeds, each yielding (seed, False) and
+        # (seed, True) for +ε and −ε perturbations respectively.
+        if args.antithetic:
+            n_seeds = args.population_size // 2
+            base_seeds = [random.randint(0, 1_000_000) for _ in range(n_seeds)]
+            seed_tasks = []
+            for s in base_seeds:
+                seed_tasks.append((s, False))   # +ε
+                seed_tasks.append((s, True))    # −ε
         else:
-            print(f"  {key:<40s} {val}")
-    print(rule())
+            base_seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
+            seed_tasks = [(s, False) for s in base_seeds]
 
+        seeds_perf: dict = {}            # (seed, negate) → metrics
+        debug_this_gen = (i % 10 == 0)  # print output sample every 10 iters
+        debug_fired    = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ES-RLVR Trainer
-# ─────────────────────────────────────────────────────────────────────────────
+        seed_iter = iter(seed_tasks)
+        inflight:  dict = {}             # object_ref → metadata
+        results_this_gen = []
 
-class ESRLVRTrainer:
-    """
-    Full trainer combining ES optimisation with OneShot-RLVR methodology.
+        # ── Prime all engines ─────────────────────────────────────────────────
+        for eng_idx, llm in enumerate(engines):
+            try:
+                seed, negate = next(seed_iter)
+            except StopIteration:
+                break
+            ray.get(llm.collective_rpc.remote(
+                "perturb_self_weights",
+                args=(seed, args.sigma, negate, args.iid_noise),
+            ))
+            handle, start_ts = evaluate_handle(llm, train_task_datas)
+            inflight[handle] = {
+                "engine":     llm,
+                "engine_idx": eng_idx,
+                "seed":       seed,
+                "negate":     negate,
+                "start_ts":   start_ts,
+            }
 
-    Gradient pipeline per step
-    ──────────────────────────
-    1. ES gradient (black-box, reward signal):
-         For each of n_pairs antithetic pairs (εᵢ, -εᵢ):
-           generate G responses with perturbed LoRA → compute rewards
-         Pool all 2·n_pairs·G rewards, GRPO-normalise to get advantages.
-         ES gradient:  (1/n_pairs·σ) · Σᵢ (Ā⁺ᵢ - Ā⁻ᵢ) · εᵢ
+        # ── Round-robin pipeline ──────────────────────────────────────────────
+        while inflight:
+            done, _ = ray.wait(list(inflight.keys()), num_returns=1)
+            h    = done[0]
+            meta = inflight.pop(h)
 
-    2. Entropy loss (white-box, autograd):
-         loss_entropy = -mean H(π_θ)   [minimise to maximise entropy]
-
-    3. KL loss (white-box, autograd, low_var_kl):
-         loss_kl = mean KL_low_var(π_θ || π_ref)
-
-    Combined gradient applied via AdamW:
-         param.grad = -ES_grad  +  entropy_coeff·∇loss_entropy
-                                +  kl_coeff·∇loss_kl
-    (Negative ES because AdamW does descent; we want ascent on reward.)
-    """
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.step = 0
-        self.history: List[Dict] = []
-
-        log.info(f"Device: {self.device}")
-        log.info(
-            f"ES: {cfg.n_pairs} antithetic pairs  σ={cfg.sigma}  "
-            f"G={cfg.rollouts_per_perturbation}  "
-            f"→ {2 * cfg.n_pairs * cfg.rollouts_per_perturbation} rollouts/step/prompt"
-        )
-        log.info(
-            f"Regularisation: entropy_coeff={cfg.entropy_coeff}  "
-            f"kl_coeff={cfg.kl_coeff}  (low_var_kl)"
-        )
-        log.info("Reward: binary correctness only — NO format reward")
-
-        os.makedirs(cfg.output_dir, exist_ok=True)
-
-        self._load_models()
-        self._setup_optimiser()
-        self._setup_data()
-
-    # ── Model setup ──────────────────────────────────────────────────────────
-
-    def _load_models(self) -> None:
-        cfg = self.cfg
-        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-
-        log.info(f"Loading tokenizer: {cfg.model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        log.info(f"Loading actor model: {cfg.model_name}")
-        base = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name,
-            torch_dtype=dtype,
-            device_map={"": self.device},
-        )
-
-        lora_cfg = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=cfg.lora_r,
-            lora_alpha=cfg.lora_alpha,
-            lora_dropout=cfg.lora_dropout,
-            target_modules=cfg.lora_target_modules,
-            bias="none",
-        )
-        self.model = get_peft_model(base, lora_cfg)
-        self.model.print_trainable_parameters()
-
-        log.info("Loading frozen reference model…")
-        ref_base = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name,
-            torch_dtype=dtype,
-            device_map={"": self.device},
-        )
-        ref_base.eval()
-        for p in ref_base.parameters():
-            p.requires_grad_(False)
-        self.ref_model = ref_base
-
-        log.info("Models ready.")
-
-    # ── Optimiser ────────────────────────────────────────────────────────────
-
-    def _setup_optimiser(self) -> None:
-        lora_params = get_lora_params(self.model)
-        log.info(f"Optimising {len(lora_params)} LoRA parameter tensors via AdamW")
-        self.optimiser = AdamW(
-            list(lora_params.values()),
-            lr=self.cfg.lr,
-            weight_decay=self.cfg.weight_decay,
-        )
-
-    # ── Data ─────────────────────────────────────────────────────────────────
-
-    def _setup_data(self) -> None:
-        cfg = self.cfg
-
-        train_all = load_dataset(cfg.data_path)
-
-        # One-shot: select highest-variance example(s)
-        if len(train_all) > cfg.n_training_examples:
-            self.train_examples = select_high_variance_examples(
-                train_all, self.model, self.tokenizer, cfg,
-                n_select=cfg.n_training_examples,
+            outputs     = ray.get(h)
+            do_debug    = debug_this_gen and not debug_fired
+            metrics     = _postprocess_outputs(
+                outputs, train_task_datas,
+                entropy_coeff=args.entropy_coeff,
+                debug_print=do_debug,
             )
-        else:
-            self.train_examples = train_all[: cfg.n_training_examples]
+            if do_debug:
+                debug_fired = True
 
-        # Validation split
-        if cfg.val_data_path:
-            self.val_data = load_dataset(cfg.val_data_path)[:50]
-        else:
-            n_val = max(8, min(50, len(train_all) // 5))
-            self.val_data = train_all[-n_val:]
+            elapsed = time.time() - meta["start_ts"]
+            key = (meta["seed"], meta["negate"])
+            seeds_perf[key] = metrics
+            results_this_gen.append({
+                "seed":            meta["seed"],
+                "negate":          meta["negate"],
+                "avg_reward":      metrics["avg_reward"],
+                "avg_correctness": metrics["avg_correctness"],
+                "avg_entropy":     metrics["avg_entropy"],
+                "time":            elapsed,
+            })
 
-        log.info(
-            f"Training on {len(self.train_examples)} example(s) "
-            f"(one-shot) | validation: {len(self.val_data)} examples"
-        )
-
-        print(banner("SELECTED TRAINING EXAMPLE(S)"))
-        for i, ex in enumerate(self.train_examples):
-            q = str(ex["chat"])
-            print(f"  [{i + 1}] Q: {q[:160]}{'…' if len(q) > 160 else ''}")
-            print(f"       A: {ex['ground_truth']}")
-        print(rule())
-
-    # ── ES gradient estimation ────────────────────────────────────────────────
-
-    def _es_gradient_step(
-        self,
-        prompts: List[str],
-        ground_truths: List[str],
-        data_sources: List[str],
-    ) -> Tuple[Dict[str, torch.Tensor], List[str], List[float], List[float]]:
-        """
-        Run the full ES rollout loop for one training step.
-
-        Returns
-        -------
-        es_grad      : ES gradient for each LoRA parameter
-        all_responses: flat list of all generated strings
-        all_rewards  : flat list of rewards  (same order)
-        advantages   : GRPO-normalised advantages (same order)
-        """
-        cfg = self.cfg
-        lora_params = get_lora_params(self.model)
-        self.model.eval()
-
-        # Storage indexed by perturbation (pair × sign)
-        # Layout: [pair0_pos_G…, pair0_neg_G…, pair1_pos_G…, pair1_neg_G…, …]
-        all_rewards:    List[float] = []
-        all_responses:  List[str]   = []
-        all_prompts_fl: List[str]   = []
-
-        # Per-perturbation reward slices: list of (sign, [rewards])
-        # We store them in the same flat order as all_rewards for easy slicing.
-        noises: List[Dict[str, torch.Tensor]] = []
-
-        G = cfg.rollouts_per_perturbation
-
-        for _pair in range(cfg.n_pairs):
-            noise = sample_noise(lora_params)
-            noises.append(noise)
-
-            for sign in (+1.0, -1.0):
-                # ── Perturb LoRA weights ──────────────────────────────────
-                apply_perturbation(lora_params, noise, cfg.sigma, sign)
-
-                # ── Rollouts ─────────────────────────────────────────────
-                # Expand each prompt G times so generate_batch handles them
-                expanded_prompts = [p for p in prompts for _ in range(G)]
-                expanded_gts     = [gt for gt in ground_truths for _ in range(G)]
-                expanded_ds      = [ds for ds in data_sources for _ in range(G)]
-
-                responses = generate_batch(
-                    self.model, self.tokenizer, expanded_prompts, cfg
-                )
-                rewards = [
-                    compute_reward(r, gt, ds)
-                    for r, gt, ds in zip(responses, expanded_gts, expanded_ds)
-                ]
-
-                all_rewards.extend(rewards)
-                all_responses.extend(responses)
-                all_prompts_fl.extend(expanded_prompts)
-
-                # ── Restore ──────────────────────────────────────────────
-                apply_perturbation(lora_params, noise, cfg.sigma, -sign)
-
-        # ── GRPO normalisation across ALL rollouts for this prompt group ──
-        # (OneShot-RLVR: normalise within group of responses from same prompt)
-        advantages = compute_grpo_advantages(all_rewards)
-
-        # ── ES gradient estimate ──────────────────────────────────────────
-        # ∇J ≈ (1 / n_pairs·σ) · Σᵢ (Ā⁺ᵢ - Ā⁻ᵢ) · εᵢ
-        n_per_perturb = len(prompts) * G   # responses per perturbation direction
-
-        es_grad: Dict[str, torch.Tensor] = {
-            name: torch.zeros_like(p.data) for name, p in lora_params.items()
-        }
-
-        cursor = 0
-        for pair_idx, noise in enumerate(noises):
-            adv_pos = advantages[cursor : cursor + n_per_perturb]
-            cursor += n_per_perturb
-            adv_neg = advantages[cursor : cursor + n_per_perturb]
-            cursor += n_per_perturb
-
-            mean_pos = float(np.mean(adv_pos)) if adv_pos else 0.0
-            mean_neg = float(np.mean(adv_neg)) if adv_neg else 0.0
-
-            # Antithetic contribution:  (Ā⁺ - Ā⁻) / σ  ×  ε
-            delta = (mean_pos - mean_neg) / cfg.sigma
-            for name in es_grad:
-                es_grad[name].add_(delta * noise[name])
-
-        # Normalise by number of pairs
-        for name in es_grad:
-            es_grad[name].div_(cfg.n_pairs)
-
-        return es_grad, all_responses, all_rewards, all_prompts_fl, advantages
-
-    # ── Single training step ──────────────────────────────────────────────────
-
-    def train_step(self) -> Dict[str, Any]:
-        cfg = self.cfg
-
-        # Build prompts from (possibly repeated) training examples
-        examples = []
-        for _ in range(max(1, cfg.batch_repeat)):
-            examples.extend(self.train_examples)
-
-        prompts       = [_format_prompt(ex, self.tokenizer) for ex in examples]
-        ground_truths = [ex["ground_truth"] for ex in examples]
-        data_sources  = [ex.get("data_source", "deepscaler") for ex in examples]
-
-        # 1. ES gradient (black-box reward signal)
-        es_grad, all_resp, all_rewards, all_prompts, advantages = (
-            self._es_gradient_step(prompts, ground_truths, data_sources)
-        )
-
-        lora_params = get_lora_params(self.model)
-        self.optimiser.zero_grad()
-
-        # Apply ES gradient as negative parameter gradient
-        # (AdamW descends on the grad; negating makes it ascend on reward)
-        for name, param in lora_params.items():
-            if name in es_grad:
-                param.grad = -es_grad[name].clone()
-
-        # 2. Entropy loss — separate white-box term (verl faithful)
-        #    Pass (prompt, response) pairs so each function can:
-        #      a) strip prompt tokens → response-only logits
-        #      b) build eos_mask → masked_mean over valid response positions
-        pr_pairs = list(zip(all_prompts[:4], all_resp[:4]))
-
-        entropy_loss = compute_entropy_loss(
-            self.model, self.tokenizer,
-            pr_pairs, self.device,
-            cfg.max_prompt_length,
-            cfg.max_prompt_length + cfg.max_new_tokens,
-        )
-
-        # 3. KL loss — separate white-box term (low_var_kl, verl faithful)
-        kl_loss = compute_kl_loss(
-            self.model, self.ref_model, self.tokenizer,
-            pr_pairs, self.device,
-            cfg.max_prompt_length,
-            cfg.max_prompt_length + cfg.max_new_tokens,
-        )
-
-        # Combine entropy + KL and backprop into existing .grad
-        reg_loss = cfg.entropy_coeff * entropy_loss + cfg.kl_coeff * kl_loss
-        if reg_loss.requires_grad:
-            reg_loss.backward()
-
-        # Gradient clipping (ES + analytical gradients combined)
-        if cfg.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                list(lora_params.values()), cfg.max_grad_norm
-            )
-
-        self.optimiser.step()
-
-        metrics: Dict[str, Any] = {
-            "step":             self.step,
-            "mean_reward":      float(np.mean(all_rewards)),
-            "accuracy":         float(np.mean([r > 0.5 for r in all_rewards])),
-            "max_reward":       float(np.max(all_rewards)),
-            "min_reward":       float(np.min(all_rewards)),
-            "mean_abs_adv":     float(np.mean(np.abs(advantages))),
-            "total_rollouts":   len(all_rewards),
-            "entropy_loss":     entropy_loss.item() if torch.is_tensor(entropy_loss) else float(entropy_loss),
-            "kl_loss":          kl_loss.item() if torch.is_tensor(kl_loss) else float(kl_loss),
-        }
-
-        # Display sample outputs
-        if self.step % cfg.log_every == 0:
-            display_training_samples(
-                all_prompts, all_resp, all_rewards, advantages,
-                self.step, n_show=cfg.n_display_samples,
-            )
-
-        return metrics
-
-    # ── Evaluation ────────────────────────────────────────────────────────────
-
-    @torch.no_grad()
-    def evaluate(self) -> Dict[str, Any]:
-        cfg = self.cfg
-        self.model.eval()
-        rewards: List[float] = []
-
-        log.info(f"Evaluating on {len(self.val_data)} examples…")
-        for item in self.val_data:
-            prompt = _format_prompt(item, self.tokenizer)
-            responses = generate_batch(self.model, self.tokenizer, [prompt], cfg)
-            rewards.append(compute_reward(
-                responses[0],
-                item["ground_truth"],
-                item.get("data_source", "deepscaler"),
+            # Restore engine weights
+            llm = meta["engine"]
+            ray.get(llm.collective_rpc.remote(
+                "restore_self_weights",
+                args=(meta["seed"], args.sigma, args.iid_noise),
             ))
 
-        return {
-            "eval/accuracy":  float(np.mean(rewards)),
-            "eval/n_correct": int(sum(rewards)),
-            "eval/n_total":   len(rewards),
-        }
+            # Schedule next seed on this engine
+            try:
+                next_seed, next_negate = next(seed_iter)
+            except StopIteration:
+                continue
 
-    # ── Checkpoint ────────────────────────────────────────────────────────────
+            ray.get(llm.collective_rpc.remote(
+                "perturb_self_weights",
+                args=(next_seed, args.sigma, next_negate, args.iid_noise),
+            ))
+            handle, start_ts = evaluate_handle(llm, train_task_datas)
+            inflight[handle] = {
+                "engine":     llm,
+                "engine_idx": meta["engine_idx"],
+                "seed":       next_seed,
+                "negate":     next_negate,
+                "start_ts":   start_ts,
+            }
+            if args.verbose:
+                sign = "(-)" if next_negate else "(+)"
+                print(f"  Scheduled seed {next_seed} {sign} → engine {meta['engine_idx']}")
 
-    def _save_checkpoint(self) -> None:
-        ckpt_dir = os.path.join(self.cfg.output_dir, f"checkpoint-{self.step}")
-        os.makedirs(ckpt_dir, exist_ok=True)
-        self.model.save_pretrained(ckpt_dir)
-        self.tokenizer.save_pretrained(ckpt_dir)
-        state = {
-            "step":    self.step,
-            "config":  vars(self.cfg),
-            "history": self.history[-50:],  # last 50 steps
-        }
-        with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
-            json.dump(state, f, indent=2, default=str)
-        log.info(f"Checkpoint saved → {ckpt_dir}")
+        # ── GRPO / ES reward normalisation ────────────────────────────────────
+        # Aᵢ = (rᵢ − mean) / (std + ε)
+        # Identical to OneShot-RLVR compute_grpo_outcome_advantage.
+        all_rewards     = [v["avg_reward"]      for v in seeds_perf.values()]
+        all_correctness = [v["avg_correctness"] for v in seeds_perf.values()]
+        all_entropy     = [v["avg_entropy"]     for v in seeds_perf.values()]
 
-    # ── Main training loop ────────────────────────────────────────────────────
+        mean_r = float(np.mean(all_rewards))      if all_rewards else 0.0
+        std_r  = float(np.std(all_rewards))       if all_rewards else 0.0
+        mean_c = float(np.mean(all_correctness))  if all_correctness else 0.0
+        mean_e = float(np.mean(all_entropy))      if all_entropy else 0.0
 
-    def fit(self) -> Dict[str, Any]:
-        cfg = self.cfg
+        print(f"\n[REWARD]  mean={mean_r:.4f}  std={std_r:.4f}  "
+              f"correctness={mean_c:.4f}  entropy_proxy={mean_e:.4f}")
 
-        print(banner("ES-RLVR TRAINING", char="═"))
-        print(f"  Model          : {cfg.model_name}")
-        print(f"  ES pairs       : {cfg.n_pairs}  (σ={cfg.sigma})")
-        print(f"  Rollouts/perturb: {cfg.rollouts_per_perturbation}")
-        print(f"  Total rollouts/step: {2 * cfg.n_pairs * cfg.rollouts_per_perturbation}")
-        print(f"  Entropy coeff  : {cfg.entropy_coeff}  (separate term)")
-        print(f"  KL coeff       : {cfg.kl_coeff}  (low_var_kl, separate term)")
-        print(f"  Reward         : binary correctness — NO format reward")
-        print(f"  Total steps    : {cfg.total_steps}")
-        print(f"  Eval every     : {cfg.eval_every}")
-        print(rule())
+        for key, v in seeds_perf.items():
+            v["norm_reward"] = (v["avg_reward"] - mean_r) / (std_r + 1e-8)
+            if args.verbose:
+                s, neg = key
+                print(f"    seed={s} {'(-)' if neg else '(+)'}: "
+                      f"reward={v['avg_reward']:.4f}  "
+                      f"norm={v['norm_reward']:.4f}  "
+                      f"correct={v['avg_correctness']:.4f}  "
+                      f"ent={v['avg_entropy']:.4f}")
 
-        best_eval_acc = 0.0
+        # Log to TensorBoard
+        writer.add_scalar("reward/mean",        mean_r, i)
+        writer.add_scalar("reward/std",         std_r,  i)
+        writer.add_scalar("reward/correctness", mean_c, i)
+        writer.add_scalar("reward/entropy",     mean_e, i)
+        if results_this_gen:
+            writer.add_scalar(
+                "reward/max_correctness",
+                max(r["avg_correctness"] for r in results_this_gen), i,
+            )
 
-        for step in range(cfg.total_steps):
-            self.step = step
-            t0 = time.time()
+        # ── ES weight update on engine 0 ──────────────────────────────────────
+        # Antithetic: Δθ += (α/N) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
+        # Standard:   Δθ += (α/N) × Aᵢ × εᵢ
+        perturb_start = time.time()
+        handles = []
 
-            metrics = self.train_step()
-            metrics["step_time_s"] = round(time.time() - t0, 2)
-            self.history.append(metrics)
+        if args.antithetic:
+            for s in base_seeds:
+                norm_pos = seeds_perf.get((s, False), {}).get("norm_reward", 0.0)
+                norm_neg = seeds_perf.get((s, True),  {}).get("norm_reward", 0.0)
+                # Combined antithetic coefficient: (A⁺ − A⁻) / N × α
+                coeff = (args.alpha / args.population_size) * (norm_pos - norm_neg)
+                if coeff != 0.0:
+                    handles.append(engines[0].collective_rpc.remote(
+                        "perturb_self_weights",
+                        args=(s, coeff, False, args.iid_noise),
+                    ))
+        else:
+            for s, neg in seed_tasks:
+                norm  = seeds_perf.get((s, neg), {}).get("norm_reward", 0.0)
+                coeff = (args.alpha / args.population_size) * norm
+                if coeff != 0.0:
+                    handles.append(engines[0].collective_rpc.remote(
+                        "perturb_self_weights",
+                        args=(s, coeff, neg, args.iid_noise),
+                    ))
 
-            # Console log
-            if step % cfg.log_every == 0:
-                log.info(
-                    f"step={step:4d} | "
-                    f"acc={metrics['accuracy']:.3f} | "
-                    f"reward={metrics['mean_reward']:.3f} | "
-                    f"entropy={metrics['entropy_loss']:.4f} | "
-                    f"kl={metrics['kl_loss']:.4f} | "
-                    f"rollouts={metrics['total_rollouts']} | "
-                    f"{metrics['step_time_s']:.1f}s"
-                )
+        ray.get(handles)
+        t_perturb = time.time() - perturb_start
+        if args.verbose:
+            print(f"  ES update applied in {t_perturb:.2f}s")
+        writer.add_scalar("time/perturbation_application", t_perturb, i)
 
-            # On-the-go evaluation
-            if step % cfg.eval_every == 0 and step > 0:
-                eval_results = self.evaluate()
-                self.history[-1].update(eval_results)
-                display_eval_results(eval_results, step)
+        # ── NCCL broadcast: engine 0 → all engines ────────────────────────────
+        broadcast_start = time.time()
+        ray.get([
+            e.collective_rpc.remote("broadcast_all_weights", args=(0,))
+            for e in engines
+        ])
+        t_broadcast = time.time() - broadcast_start
+        if args.verbose:
+            print(f"  Broadcast in {t_broadcast:.2f}s")
+        writer.add_scalar("time/broadcast", t_broadcast, i)
 
-                if eval_results["eval/accuracy"] > best_eval_acc:
-                    best_eval_acc = eval_results["eval/accuracy"]
-                    log.info(f"  ★ New best eval accuracy: {best_eval_acc:.4f}")
+        # ── Iteration timing ──────────────────────────────────────────────────
+        t_iter = time.time() - total_iter_start
+        writer.add_scalar("time/iteration", t_iter, i)
+        print(f"[ITER] Wall clock: {t_iter:.1f}s")
+        print(f"  Generation {i} done.\n")
 
-            # Checkpoint
-            if step % cfg.save_every == 0 and step > 0:
-                self._save_checkpoint()
+        # ── On-the-go validation ──────────────────────────────────────────────
+        if val_task_datas and (
+            i % args.val_every == 0 or i == args.num_iterations - 1
+        ):
+            evaluate_val_set(
+                engines[0], val_task_datas, args.val_batch_size,
+                i, writer, args.verbose,
+            )
 
-        # Final evaluation
-        log.info("Training complete — running final evaluation…")
-        final = self.evaluate()
-        display_eval_results(final, self.step)
-
-        self._save_checkpoint()
-
-        with open(os.path.join(cfg.output_dir, "metrics.json"), "w") as f:
-            json.dump(self.history, f, indent=2, default=str)
-
-        log.info(f"All results saved → {cfg.output_dir}")
-        log.info(f"Best eval accuracy: {best_eval_acc:.4f}")
-        return final
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="ES-RLVR: Evolution Strategies RLVR (OneShot-RLVR methodology)"
+    # ── Save final model weights ──────────────────────────────────────────────
+    final_path = f"{model_saves_dir}/final_model_iter_{args.num_iterations}"
+    os.makedirs(final_path, exist_ok=True)
+    ray.get(
+        engines[0].collective_rpc.remote(
+            "save_self_weights_to_disk",
+            args=(f"{final_path}/pytorch_model.pth",),
+        )
     )
+    print(f"\n[SAVE] Final weights saved to {final_path}/pytorch_model.pth")
 
-    # Model
-    p.add_argument("--model_name", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
-
-    # LoRA
-    p.add_argument("--lora_r",     type=int,   default=16)
-    p.add_argument("--lora_alpha", type=int,   default=32)
-
-    # ES
-    p.add_argument("--n_pairs",                   type=int,   default=5,
-                   help="Antithetic pairs (2*n_pairs total perturbations)")
-    p.add_argument("--sigma",                      type=float, default=0.005,
-                   help="LoRA perturbation scale")
-    p.add_argument("--rollouts_per_perturbation",  type=int,   default=4,
-                   help="G: rollouts per prompt per perturbation")
-
-    # One-shot data
-    p.add_argument("--n_training_examples", type=int,   default=1)
-    p.add_argument("--batch_repeat",        type=int,   default=1)
-    p.add_argument("--n_probe_runs",        type=int,   default=8)
-
-    # Generation
-    p.add_argument("--max_prompt_length", type=int,   default=512)
-    p.add_argument("--max_new_tokens",    type=int,   default=512)
-    p.add_argument("--temperature",       type=float, default=0.7)
-
-    # Regularisation (OneShot-RLVR defaults)
-    p.add_argument("--entropy_coeff", type=float, default=0.001)
-    p.add_argument("--kl_coeff",      type=float, default=0.001)
-
-    # Optimiser
-    p.add_argument("--lr",            type=float, default=1e-6)
-    p.add_argument("--max_grad_norm", type=float, default=1.0)
-
-    # Training loop
-    p.add_argument("--total_steps", type=int, default=500)
-    p.add_argument("--eval_every",  type=int, default=25)
-    p.add_argument("--log_every",   type=int, default=5)
-    p.add_argument("--save_every",  type=int, default=100)
-
-    # Data & output
-    p.add_argument("--data_path",
-                   default="Dataset parquet/pi1_r128.parquet",
-                   help="Training dataset (.parquet / .json / .jsonl). "
-                        "Verl parquet schema: prompt (chat list), reward_model.ground_truth.")
-    p.add_argument("--val_data_path",
-                   default="Dataset parquet/math500.parquet",
-                   help="Validation dataset (same schema as data_path).")
-    p.add_argument("--output_dir",    default="./es_rlvr_output")
-    p.add_argument("--seed",          type=int, default=42)
-
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    set_seed(args.seed)
-
-    cfg = Config(**{k: v for k, v in vars(args).items() if hasattr(Config, k)})
-
-    trainer = ESRLVRTrainer(cfg)
-    trainer.fit()
+    cleanup()
+    writer.close()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args)

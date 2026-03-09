@@ -64,3 +64,26 @@ class WorkerExtension:
             torch.cuda.empty_cache()
         time.sleep(0.1)
         return True
+
+    def load_weights_from_disk(self, filepath):
+        """
+        Load weights from a .pth file saved by save_self_weights_to_disk,
+        or a HuggingFace state_dict saved via model.save_pretrained() +
+        torch.load().  Useful for syncing an HF-updated checkpoint back
+        into vLLM engines.
+
+        Returns the number of parameter tensors successfully matched and
+        loaded; mismatched or missing keys are silently skipped.
+        """
+        state_dict = torch.load(filepath, map_location=self.device)
+        matched = 0
+        for name, p in self.model_runner.model.named_parameters():
+            if name in state_dict:
+                p.data.copy_(state_dict[name].to(dtype=p.dtype, device=p.device))
+                matched += 1
+        del state_dict
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        return matched
