@@ -158,8 +158,8 @@ class Config:
     n_display_samples: int = 2        # how many outputs to print each log step
 
     # ── Paths ────────────────────────────────────────────────────────────────
-    data_path: str = ""            # required — path to train dataset file
-    val_data_path: Optional[str] = None
+    data_path: str = "Dataset parquet/pi1_r128.parquet"
+    val_data_path: Optional[str] = "Dataset parquet/math500.parquet"
     output_dir: str = "./es_rlvr_output"
 
     # ── Reproducibility ──────────────────────────────────────────────────────
@@ -167,140 +167,40 @@ class Config:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Math Reward Functions  (OneShot-RLVR deepscaler.py + math.py faithful)
-# Binary correctness ONLY — zero if no \boxed{} found — NO format reward
+# Reward  — delegate entirely to deepscaler.compute_score()
 # ─────────────────────────────────────────────────────────────────────────────
+# deepscaler.py (in this repo) is the authoritative reward implementation.
+# It mirrors verl/utils/reward_score/deepscaler.py exactly:
+#   - Extract \boxed{} answer from response
+#   - Return 1.0 if correct via grade_answer_mathd / grade_answer_sympy
+#   - Return 0.0 otherwise  (no format reward, no partial credit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from deepscaler import compute_score as _deepscaler_compute_score, SYSTEM_PROMPT  # noqa: E402
+
 
 def extract_answer(text: str) -> Optional[str]:
-    """
-    Extract the last \\boxed{...} or \\fbox{...} content from a response.
-    Matches OneShot-RLVR verl/utils/reward_score/deepscaler.py extract_answer().
-    Returns None when no box is found → reward = 0 (no partial credit).
-    """
-    # handles one level of nested braces: \boxed{a + \frac{1}{2}}
+    """Extract last \\boxed{} from text — used only for display, not grading."""
     pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
     matches = re.findall(pattern, text)
-    if matches:
-        return matches[-1].strip()
-
-    pattern2 = r"\\fbox\{((?:[^{}]|\{[^{}]*\})*)\}"
-    matches2 = re.findall(pattern2, text)
-    if matches2:
-        return matches2[-1].strip()
-
-    return None
+    return matches[-1].strip() if matches else None
 
 
-def _normalize(s: str) -> str:
+def compute_reward(response: str, ground_truth: str,
+                   data_source: str = "deepscaler") -> float:
     """
-    Normalise a math answer string for string comparison.
-    Mirrors OneShot-RLVR verl/utils/reward_score/math.py normalisation.
+    Thin wrapper around deepscaler.compute_score().
+
+    Passes use_think=False (no <think>...</think> stripping) matching
+    the OneShot-RLVR training setup.  Returns 1.0 or 0.0 — binary only.
     """
-    s = str(s).strip()
-
-    # Strip LaTeX whitespace commands
-    for cmd in (r"\,", r"\!", r"\ ", r"\quad", r"\qquad"):
-        s = s.replace(cmd, "")
-    s = s.replace(r"\left", "").replace(r"\right", "")
-
-    # \text{...} → contents
-    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
-
-    # \frac{a}{b} → (a)/(b)
-    for frac in (r"\\frac", r"\\tfrac", r"\\dfrac"):
-        s = re.sub(frac + r"\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", s)
-
-    # \sqrt{x} → sqrt(x)
-    s = re.sub(r"\\sqrt\{([^}]+)\}", r"sqrt(\1)", s)
-
-    # commas in numbers  1,000 → 1000
-    s = re.sub(r"(\d),(\d)", r"\1\2", s)
-
-    # drop all remaining LaTeX backslash commands
-    s = re.sub(r"\\[a-zA-Z]+", "", s)
-
-    # collapse whitespace
-    s = re.sub(r"\s+", "", s)
-
-    return s.lower()
-
-
-def _grade_sympy(pred: str, gt: str) -> bool:
-    """Symbolic comparison via sympy (optional, silent on failure)."""
-    try:
-        from sympy import simplify, sympify, N as sym_N  # noqa: N812
-
-        e1 = sympify(pred)
-        e2 = sympify(gt)
-        diff = simplify(e1 - e2)
-        if diff == 0:
-            return True
-        try:
-            if abs(float(sym_N(diff))) < 1e-6:
-                return True
-        except Exception:
-            pass
-    except Exception:
-        pass
-    return False
-
-
-def grade_answer(predicted: str, ground_truth: str) -> bool:
-    """
-    Determine whether `predicted` matches `ground_truth`.
-    Mirrors OneShot-RLVR grade_answer_mathd + grade_answer_sympy cascade.
-    """
-    pn = _normalize(predicted)
-    gn = _normalize(ground_truth)
-
-    if pn == gn:
-        return True
-
-    # numeric comparison
-    try:
-        if abs(float(pn) - float(gn)) < 1e-6 * max(abs(float(gn)), 1.0):
-            return True
-    except (ValueError, ArithmeticError):
-        pass
-
-    return _grade_sympy(pn, gn)
-
-
-def compute_reward(response: str, ground_truth: str) -> float:
-    """
-    Binary math correctness reward.
-
-    OneShot-RLVR deepscaler.py compute_score() (use_think=False branch):
-      - Extract answer from \\boxed{}
-      - Return 0.0 if no box found
-      - Return 1.0 if correct, 0.0 if not
-      - NO format reward, no partial credit
-
-    This function is the single source of truth for all reward computation
-    in this codebase.
-    """
-    answer = extract_answer(response)
-    if answer is None:
-        return 0.0
-
-    # ground truth may itself carry \boxed{} from the dataset
-    gt = ground_truth.strip()
-    if r"\boxed{" in gt:
-        gt = extract_answer(gt) or gt
-
-    return 1.0 if grade_answer(answer, gt) else 0.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt template
-# ─────────────────────────────────────────────────────────────────────────────
-
-PROMPT_TEMPLATE = (
-    "You are a math expert. Solve the following problem step by step. "
-    "Write your final answer inside \\boxed{{}}.\n\n"
-    "Problem: {question}\n\n"
-    "Solution:"
-)
+    return float(_deepscaler_compute_score(
+        data_source=data_source,
+        solution_str=response,
+        ground_truth=ground_truth,
+        extra_info=None,
+        use_think=False,
+    ))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -309,14 +209,18 @@ PROMPT_TEMPLATE = (
 
 def load_dataset(path: str) -> List[Dict]:
     """
-    Load a dataset from a JSON / JSONL / Parquet file.
-    Each record must have 'question' and 'answer' keys.
+    Load a dataset in verl parquet format (the schema used by pi1_r128 and
+    math500 in this repo) or plain JSON/JSONL.
 
-    Supported formats
-    -----------------
-    .jsonl   — one JSON object per line
-    .json    — list of objects
-    .parquet — pandas DataFrame with 'question' and 'answer' columns
+    Verl parquet schema (columns):
+      prompt       — list of chat dicts, e.g. [{"role": "user", "content": "…"}]
+      reward_model — dict with key "ground_truth"
+      data_source  — string, e.g. "deepscaler" or "simplerl/math500"
+
+    Each returned record has:
+      "chat"          : the raw prompt list (to be formatted with apply_chat_template)
+      "ground_truth"  : string answer
+      "data_source"   : string
     """
     p = Path(path)
     if not p.exists():
@@ -329,9 +233,17 @@ def load_dataset(path: str) -> List[Dict]:
         try:
             import pandas as pd  # type: ignore
         except ImportError:
-            raise ImportError("pandas is required to load parquet files: pip install pandas pyarrow")
+            raise ImportError("pip install pandas pyarrow")
         df = pd.read_parquet(p)
-        data = df[["question", "answer"]].to_dict(orient="records")
+        data = []
+        for _, row in df.iterrows():
+            rm = row["reward_model"]
+            gt = rm["ground_truth"] if isinstance(rm, dict) else str(rm)
+            data.append({
+                "chat":         list(row["prompt"]),
+                "ground_truth": str(gt),
+                "data_source":  str(row.get("data_source", "deepscaler")),
+            })
     elif p.suffix == ".jsonl":
         with open(p) as f:
             data = [json.loads(line) for line in f if line.strip()]
@@ -341,6 +253,18 @@ def load_dataset(path: str) -> List[Dict]:
 
     log.info(f"Loaded {len(data)} examples from {path}")
     return data
+
+
+def _format_prompt(item: Dict, tokenizer) -> str:
+    """
+    Build the full prompt string from a verl-format record.
+    Prepends SYSTEM_PROMPT (from deepscaler.py) then applies the chat template,
+    matching es_fine_tuning_deepscaler_accl.py exactly.
+    """
+    chat_with_system = [{"role": "system", "content": SYSTEM_PROMPT}] + item["chat"]
+    return tokenizer.apply_chat_template(
+        chat_with_system, tokenize=False, add_generation_prompt=True
+    )
 
 
 @torch.no_grad()
@@ -357,27 +281,44 @@ def select_high_variance_examples(
     Adapted from OneShot-RLVR data/data_selection.py acc_score(method='std'):
       variance_score(i) = std( probe_accuracy_over_runs(i) )
 
-    High-variance examples sit at the 'learning frontier' — the model
-    sometimes gets them right and sometimes wrong — ideal for RL training.
-    Scans up to the first 100 examples for speed.
+    Deduplicates by ground_truth first — pi1_r128 contains 128 identical rows,
+    so probing every row would be wasteful.  Only unique questions are scored.
     """
-    pool = dataset[: min(100, len(dataset))]
+    # Deduplicate by (chat content, ground_truth) so pi1_r128's 128 copies
+    # collapse to 1 unique example without skipping genuine diversity.
+    seen: set = set()
+    unique: List[Dict] = []
+    for item in dataset:
+        key = (str(item["chat"]), item["ground_truth"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    if len(unique) == 1:
+        # Already a single unique example — no probing needed.
+        log.info(f"  Dataset has 1 unique example — skipping variance probe.")
+        q_preview = str(unique[0]["chat"])[:100]
+        log.info(f"  Training example: {q_preview}…")
+        return unique[:n_select]
+
+    pool = unique[: min(100, len(unique))]
     log.info(
-        f"Scoring {len(pool)} candidates for variance "
+        f"Scoring {len(pool)} unique candidates for variance "
         f"({cfg.n_probe_runs} probe runs each)…"
     )
 
     model.eval()
+    device = next(model.parameters()).device
     variances = []
 
     for idx, item in enumerate(pool):
-        prompt = PROMPT_TEMPLATE.format(question=item["question"])
+        prompt = _format_prompt(item, tokenizer)
         enc = tokenizer(
             prompt,
             return_tensors="pt",
             truncation=True,
             max_length=cfg.max_prompt_length,
-        ).to(next(model.parameters()).device)
+        ).to(device)
 
         scores = []
         for _ in range(cfg.n_probe_runs):
@@ -391,9 +332,10 @@ def select_high_variance_examples(
                     pad_token_id=tokenizer.eos_token_id,
                 )
                 resp = tokenizer.decode(
-                    out[0][enc.input_ids.shape[1] :], skip_special_tokens=True
+                    out[0][enc.input_ids.shape[1]:], skip_special_tokens=True
                 )
-                scores.append(compute_reward(resp, item["answer"]))
+                scores.append(compute_reward(resp, item["ground_truth"],
+                                             item.get("data_source", "deepscaler")))
             except Exception:
                 scores.append(0.0)
 
@@ -404,13 +346,14 @@ def select_high_variance_examples(
         if (idx + 1) % 20 == 0:
             log.info(f"  Probed {idx + 1}/{len(pool)}…")
 
-    variances.sort(key=lambda x: x[1], reverse=True)  # highest variance first
+    variances.sort(key=lambda x: x[1], reverse=True)
 
     selected = []
     for rank, (idx, var, mean_acc) in enumerate(variances[:n_select]):
+        q_preview = str(pool[idx]["chat"])[:80]
         log.info(
-            f"  Selected #{rank + 1}: idx={idx}  var={var:.3f}  mean_acc={mean_acc:.2f}"
-            f"  Q: {pool[idx]['question'][:80]}…"
+            f"  Selected #{rank + 1}: idx={idx}  var={var:.3f}  "
+            f"mean_acc={mean_acc:.2f}  Q: {q_preview}…"
         )
         selected.append(pool[idx])
 
@@ -963,9 +906,9 @@ class ESRLVRTrainer:
 
         print(banner("SELECTED TRAINING EXAMPLE(S)"))
         for i, ex in enumerate(self.train_examples):
-            q = ex["question"]
+            q = str(ex["chat"])
             print(f"  [{i + 1}] Q: {q[:160]}{'…' if len(q) > 160 else ''}")
-            print(f"       A: {ex['answer']}")
+            print(f"       A: {ex['ground_truth']}")
         print(rule())
 
     # ── ES gradient estimation ────────────────────────────────────────────────
@@ -974,6 +917,7 @@ class ESRLVRTrainer:
         self,
         prompts: List[str],
         ground_truths: List[str],
+        data_sources: List[str],
     ) -> Tuple[Dict[str, torch.Tensor], List[str], List[float], List[float]]:
         """
         Run the full ES rollout loop for one training step.
@@ -1013,13 +957,14 @@ class ESRLVRTrainer:
                 # Expand each prompt G times so generate_batch handles them
                 expanded_prompts = [p for p in prompts for _ in range(G)]
                 expanded_gts     = [gt for gt in ground_truths for _ in range(G)]
+                expanded_ds      = [ds for ds in data_sources for _ in range(G)]
 
                 responses = generate_batch(
                     self.model, self.tokenizer, expanded_prompts, cfg
                 )
                 rewards = [
-                    compute_reward(r, gt)
-                    for r, gt in zip(responses, expanded_gts)
+                    compute_reward(r, gt, ds)
+                    for r, gt, ds in zip(responses, expanded_gts, expanded_ds)
                 ]
 
                 all_rewards.extend(rewards)
@@ -1072,12 +1017,13 @@ class ESRLVRTrainer:
         for _ in range(max(1, cfg.batch_repeat)):
             examples.extend(self.train_examples)
 
-        prompts      = [PROMPT_TEMPLATE.format(question=ex["question"]) for ex in examples]
-        ground_truths = [ex["answer"] for ex in examples]
+        prompts       = [_format_prompt(ex, self.tokenizer) for ex in examples]
+        ground_truths = [ex["ground_truth"] for ex in examples]
+        data_sources  = [ex.get("data_source", "deepscaler") for ex in examples]
 
         # 1. ES gradient (black-box reward signal)
         es_grad, all_resp, all_rewards, all_prompts, advantages = (
-            self._es_gradient_step(prompts, ground_truths)
+            self._es_gradient_step(prompts, ground_truths, data_sources)
         )
 
         lora_params = get_lora_params(self.model)
@@ -1154,9 +1100,13 @@ class ESRLVRTrainer:
 
         log.info(f"Evaluating on {len(self.val_data)} examples…")
         for item in self.val_data:
-            prompt = PROMPT_TEMPLATE.format(question=item["question"])
+            prompt = _format_prompt(item, self.tokenizer)
             responses = generate_batch(self.model, self.tokenizer, [prompt], cfg)
-            rewards.append(compute_reward(responses[0], item["answer"]))
+            rewards.append(compute_reward(
+                responses[0],
+                item["ground_truth"],
+                item.get("data_source", "deepscaler"),
+            ))
 
         return {
             "eval/accuracy":  float(np.mean(rewards)),
@@ -1297,12 +1247,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_every",  type=int, default=100)
 
     # Data & output
-    p.add_argument("--data_path",     required=True,
-                   help="Path to training dataset (.json / .jsonl / .parquet). "
-                        "Each record must have 'question' and 'answer' keys.")
-    p.add_argument("--val_data_path", default=None,
-                   help="Optional validation dataset. If omitted, last 20%% of "
-                        "train data is used (capped at 50 examples).")
+    p.add_argument("--data_path",
+                   default="Dataset parquet/pi1_r128.parquet",
+                   help="Training dataset (.parquet / .json / .jsonl). "
+                        "Verl parquet schema: prompt (chat list), reward_model.ground_truth.")
+    p.add_argument("--val_data_path",
+                   default="Dataset parquet/math500.parquet",
+                   help="Validation dataset (same schema as data_path).")
     p.add_argument("--output_dir",    default="./es_rlvr_output")
     p.add_argument("--seed",          type=int, default=42)
 
