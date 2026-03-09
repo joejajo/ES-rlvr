@@ -56,46 +56,81 @@ Branch names for AI-generated work must start with `claude/` and end with the se
 
 ## Development Setup
 
-> This section should be updated once the project is initialized.
+### Conda Environment
 
-Expected setup steps (fill in when project is scaffolded):
+**Activate before running anything:**
+```bash
+conda activate grpo
+# env path: /home/woody/iwi7/iwi7107h/conda_envs/grpo
+```
+
+Key package versions in `grpo` env:
+| Package | Version |
+|---|---|
+| Python | 3.12.11 |
+| torch | 2.10.0 |
+| vllm | 0.17.0 |
+| ray | 2.54.0 |
+| transformers | 4.57.0 |
+| peft | 0.17.1 |
+| trl | 0.23.1 |
+| accelerate | 1.10.1 |
+| datasets | 4.2.0 |
+| pandas | 2.3.3 |
+| pyarrow | 21.0.0 |
+| numpy | 2.2.6 |
+| tensorboard | 2.20.0 |
+| flashinfer-python | 0.6.4 |
+| triton | 3.6.0 |
+| CUDA runtime | 12.4 (pytorch-cuda 12.4) |
+| nvidia-nccl-cu12 | 2.27.5 |
+| sympy | 1.14.0 |
+
+Full env snapshot: `conda list` in the `grpo` environment (recorded 2026-03-09).
+
+### Running the training script
 
 ```bash
-# Clone
-git clone <repo-url>
-cd ES-rlvr
-
-# Install dependencies (update as appropriate)
-# pip install -e .       # Python project
-# npm install            # Node project
-# make install           # Makefile-driven project
+conda activate grpo
+cd /path/to/ES-rlvr
+python es_rlvr_train.py \
+  --model_name Qwen/Qwen2.5-Math-1.5B-Instruct \
+  --parquet_path "Dataset parquet/pi1_r128.parquet" \
+  --val_parquet_path "Dataset parquet/math500.parquet" \
+  --num_engines 4 \
+  --cuda_devices 0,1,2,3
 ```
 
 ---
 
 ## Project Structure
 
-> To be filled in once source code is committed.
-
-Expected layout for an RL/training project:
-
 ```
 ES-rlvr/
-├── CLAUDE.md           # This file
-├── README.md           # Project description
-├── pyproject.toml      # Python packaging & dependencies
-├── src/                # Main source code
-│   └── es_rlvr/
-│       ├── __init__.py
-│       ├── trainer.py
-│       ├── models/
-│       └── envs/
-├── scripts/            # Training/evaluation entry points
-├── tests/              # Unit and integration tests
-├── configs/            # Hyperparameter / experiment configs
-└── .github/
-    └── workflows/      # CI/CD pipelines
+├── CLAUDE.md                          # This file
+├── es_rlvr_train.py                   # Main training script (vLLM+Ray+NCCL ES loop)
+├── es_fine_tuning_deepscaler_accl.py  # Reference: VsonicV/es-fine-tuning-paper base
+├── deepscaler.py                      # Reward: binary correctness via \boxed{} extraction
+├── utils/
+│   └── worker_extn.py                 # vLLM WorkerExtension (perturb/restore/broadcast/save/load)
+└── Dataset parquet/
+    ├── pi1_r128.parquet               # Train: 128 rows, 1 unique question, ground_truth="12.8"
+    └── math500.parquet                # Val:   500 rows, simplerl/math500 source
 ```
+
+### Key files
+
+- **`es_rlvr_train.py`**: ES-RLVR training loop combining:
+  - vLLM + Ray + NCCL architecture (from `es_fine_tuning_deepscaler_accl.py`)
+  - One-Shot-RLVR methodology (binary reward, GRPO z-score, entropy bonus, antithetic pairs)
+  - On-the-go validation on math500, model output display during training
+
+- **`deepscaler.py`**: Authoritative reward module. Returns 1.0 (correct) / 0.0 (wrong).
+  No format reward. Uses `extract_answer` → `grade_answer_mathd` / `grade_answer_sympy`.
+
+- **`utils/worker_extn.py`**: vLLM `WorkerExtension` injected via `worker_extension_cls`.
+  Methods: `perturb_self_weights`, `restore_self_weights`, `init_inter_engine_group`,
+  `broadcast_all_weights`, `save_self_weights_to_disk`, `load_weights_from_disk`.
 
 ---
 
