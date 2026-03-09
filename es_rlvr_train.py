@@ -158,7 +158,7 @@ class Config:
     n_display_samples: int = 2        # how many outputs to print each log step
 
     # ── Paths ────────────────────────────────────────────────────────────────
-    data_path: Optional[str] = None
+    data_path: str = ""            # required — path to train dataset file
     val_data_path: Optional[str] = None
     output_dir: str = "./es_rlvr_output"
 
@@ -307,44 +307,40 @@ PROMPT_TEMPLATE = (
 # Data utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_dataset(path: Optional[str]) -> List[Dict]:
+def load_dataset(path: str) -> List[Dict]:
     """
-    Load a dataset from a JSON / JSONL file, or fall back to GSM8K via
-    HuggingFace datasets.  Each record must have 'question' and 'answer'.
+    Load a dataset from a JSON / JSONL / Parquet file.
+    Each record must have 'question' and 'answer' keys.
+
+    Supported formats
+    -----------------
+    .jsonl   — one JSON object per line
+    .json    — list of objects
+    .parquet — pandas DataFrame with 'question' and 'answer' columns
     """
-    if path is not None:
-        p = Path(path)
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {path}\n"
+            f"Pass the correct path via --data_path"
+        )
+
+    if p.suffix == ".parquet":
+        try:
+            import pandas as pd  # type: ignore
+        except ImportError:
+            raise ImportError("pandas is required to load parquet files: pip install pandas pyarrow")
+        df = pd.read_parquet(p)
+        data = df[["question", "answer"]].to_dict(orient="records")
+    elif p.suffix == ".jsonl":
         with open(p) as f:
-            if p.suffix == ".jsonl":
-                data = [json.loads(line) for line in f if line.strip()]
-            else:
-                data = json.load(f)
-        log.info(f"Loaded {len(data)} examples from {path}")
-        return data
+            data = [json.loads(line) for line in f if line.strip()]
+    else:
+        with open(p) as f:
+            data = json.load(f)
 
-    # default: GSM8K
-    try:
-        from datasets import load_dataset as hf_load  # type: ignore
-
-        log.info("Loading GSM8K from HuggingFace datasets…")
-        ds = hf_load("gsm8k", "main", split="train")
-        return [{"question": x["question"], "answer": x["answer"]} for x in ds]
-    except Exception as exc:
-        log.warning(f"Could not load GSM8K ({exc}). Using built-in demo data.")
-        return _demo_data()
-
-
-def _demo_data() -> List[Dict]:
-    return [
-        {"question": "What is 15 + 27?", "answer": "42"},
-        {"question": "A train travels at 60 mph for 2.5 hours. How far does it go?", "answer": "150"},
-        {"question": "What is the square root of 144?", "answer": "12"},
-        {"question": "Solve for x: 2x + 5 = 17", "answer": "6"},
-        {"question": "What is 12 × 13?", "answer": "156"},
-        {"question": "A rectangle has width 4 and height 7. What is its area?", "answer": "28"},
-        {"question": "What is 15% of 200?", "answer": "30"},
-        {"question": "If f(x) = 3x + 1, what is f(4)?", "answer": "13"},
-    ]
+    log.info(f"Loaded {len(data)} examples from {path}")
+    return data
 
 
 @torch.no_grad()
@@ -1301,8 +1297,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_every",  type=int, default=100)
 
     # Data & output
-    p.add_argument("--data_path",     default=None)
-    p.add_argument("--val_data_path", default=None)
+    p.add_argument("--data_path",     required=True,
+                   help="Path to training dataset (.json / .jsonl / .parquet). "
+                        "Each record must have 'question' and 'answer' keys.")
+    p.add_argument("--val_data_path", default=None,
+                   help="Optional validation dataset. If omitted, last 20%% of "
+                        "train data is used (capped at 50 examples).")
     p.add_argument("--output_dir",    default="./es_rlvr_output")
     p.add_argument("--seed",          type=int, default=42)
 
