@@ -694,6 +694,29 @@ def main(args):
     csv_path = os.path.join(logging_dir, "metrics.csv")
     csv_header_written = False
 
+    # ── Pre-training baseline validation ─────────────────────────────────────
+    if val_task_datas:
+        print("[BASELINE] Evaluating before any training...")
+        baseline_acc = evaluate_val_set(
+            engines[0], val_task_datas, args.val_batch_size,
+            -1, writer, val_show_n=args.val_show_n,
+        )
+        history["val_iter"].append(-1)
+        history["val_accuracy"].append(baseline_acc)
+        with open(csv_path, "w", newline="") as f:
+            import csv as _csv
+            w = _csv.DictWriter(f, fieldnames=[
+                "iter", "train_correctness", "reward_mean",
+                "reward_std", "entropy", "entropy_coverage", "val_accuracy",
+            ])
+            w.writeheader()
+            w.writerow({
+                "iter": "baseline", "train_correctness": "",
+                "reward_mean": "", "reward_std": "",
+                "entropy": "", "entropy_coverage": "", "val_accuracy": baseline_acc,
+            })
+        csv_header_written = True
+
     # ──────────────────────────────────────────────────────────────────────────
     # Training loop
     # ──────────────────────────────────────────────────────────────────────────
