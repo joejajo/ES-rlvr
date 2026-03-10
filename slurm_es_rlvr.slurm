@@ -1,11 +1,9 @@
 #!/bin/bash -l
 #SBATCH --job-name=es_rlvr
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:4
+#SBATCH --partition=a100
+#SBATCH --gres=gpu:a100:4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
 #SBATCH --time=10:00:00
 #SBATCH --output=/home/woody/iwi7/iwi7107h/Esrlvr/outputs/%x_%j.out
 #SBATCH --error=/home/woody/iwi7/iwi7107h/Esrlvr/outputs/%x_%j.err
