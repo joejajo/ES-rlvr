@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
-#SBATCH --output=/home/woody/iwi7/iwi7107h/Esrlvr/Output/result_%j/%x_%j.out
-#SBATCH --error=/home/woody/iwi7/iwi7107h/Esrlvr/Output/result_%j/%x_%j.err
+#SBATCH --output=/home/woody/iwi7/iwi7107h/Esrlvr/outputs/%x_%j.out
+#SBATCH --error=/home/woody/iwi7/iwi7107h/Esrlvr/outputs/%x_%j.err
 #SBATCH --export=NONE
 # =============================================================================
 #  ES-RLVR — 4-GPU SLURM script
@@ -31,7 +31,7 @@ set -u
 BASE_DIR="/home/woody/iwi7/iwi7107h/Esrlvr"
 TRAIN_PARQUET="${BASE_DIR}/Dataset parquet/pi1_r128.parquet"
 VAL_PARQUET="${BASE_DIR}/Dataset parquet/math500.parquet"
-OUT_DIR="${BASE_DIR}/Output/result_${SLURM_JOB_ID}"
+OUT_DIR="${BASE_DIR}/outputs/results_${SLURM_JOB_ID}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -50,7 +50,7 @@ unset RAY_HEAD_IP
 unset RAY_GCS_SERVER_ADDRESS
 
 # ── Hyperparameters (override via --export=ALL,VAR=val) ─────────────────────
-MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-Math-1.5B-Instruct}"
+MODEL_NAME="${MODEL_NAME:-/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B}"
 SIGMA="${SIGMA:-0.001}"
 ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-20}"
