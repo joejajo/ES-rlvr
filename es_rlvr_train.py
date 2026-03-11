@@ -21,12 +21,11 @@ One-Shot-RLVR design principles preserved
   log-softmax values, not raw logits; a direct forward pass requires
   vLLM-internal attention metadata (FlashInferMetadata) that is
   version-tied and fragile to build externally.
-  We use a tight lower-bound approximation with top-100 logprobs:
-    H_approx = −Σ_{i=1}^{100} p_i log p_i  −  p_tail log p_tail
-  where p_tail = 1 − Σ p_i.  For Qwen2.5-Math-1.5B on math tokens,
-  top-100 covers >99.9% probability mass; the tail bucket makes this
-  a tight lower bound on true Shannon entropy rather than ignoring
-  missing mass entirely.  The gradient direction is exact.
+  We use a tight lower-bound approximation with top-20 logprobs (vLLM max):
+    H_approx = −Σ_{i=1}^{20} p_i log p_i  −  p_tail log p_tail
+  where p_tail = 1 − Σ p_i.  The tail bucket makes this a lower bound
+  on true Shannon entropy rather than ignoring missing mass entirely.
+  The gradient direction is exact.
 - KL penalty: omitted.  Computing low_var_kl requires a reference model
   forward pass.  In a pure vLLM inference architecture there is no
   autograd model resident in memory, so this term is not feasible
