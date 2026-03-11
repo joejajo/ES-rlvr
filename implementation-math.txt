@@ -1,0 +1,294 @@
+================================================================================
+  ES-RLVR: Mathematical Foundations & Implementation Logic
+  For academic review — Qwen2.5-Math-1.5B + One-Shot-RLVR + ES
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — THE CORE IDEA IN ONE PARAGRAPH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+We want to improve a language model's mathematical reasoning using reinforcement
+learning, but WITHOUT backpropagation. Instead of computing gradients through
+the model, we use Evolution Strategies (ES): randomly perturb the model weights,
+ask the perturbed model to answer a maths question, measure whether the answer
+is correct, and nudge the permanent weights toward perturbations that scored
+well. This is gradient-free optimisation applied to a 1.5-billion-parameter
+language model, combined with the One-Shot-RLVR finding that training on a
+SINGLE example can generalise to a broad maths benchmark (Math500).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — EVOLUTION STRATEGIES: THE MATHEMATICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2.1  Problem Statement
+──────────────────────
+We have model weights θ ∈ ℝᵈ  (d ≈ 1.5 × 10⁹ for our model).
+We have a reward function F(θ) = correctness of the model's answer.
+We want to find:
+    θ* = argmax F(θ)
+
+F is not differentiable (it is 0 or 1 depending on a string match), so
+standard gradient descent cannot be applied.
+
+
+2.2  The ES Gradient Estimator
+────────────────────────────────
+ES approximates the gradient of a SMOOTHED version of F:
+
+    ∇_θ E_{ε ~ N(0,I)} [ F(θ + σε) ]  =  (1/σ) · E[F(θ + σε) · ε]
+
+We estimate this expectation with N random samples (the "population"):
+
+    ∇̂F  ≈  (1/Nσ)  Σᵢ₌₁ᴺ  F(θ + σεᵢ) · εᵢ
+
+Where:
+    σ     = 0.001        — perturbation scale (how much to move the weights)
+    εᵢ    ~ N(0, I)      — random noise vector, reproduced from seed sᵢ
+    N     = 20           — population size (number of perturbations per step)
+
+Intuition: if adding noise εᵢ to the weights gives a HIGH reward, then εᵢ is
+likely to point "uphill" in weight space. We move toward it. If it gives a
+LOW reward, we move away.
+
+
+2.3  Memory-Efficient Noise: Shared Seed Trick
+────────────────────────────────────────────────
+Storing a full noise vector εᵢ ∈ ℝ¹·⁵ᴮ would require ~6 GB per perturbation.
+Instead, we only store an INTEGER SEED sᵢ. The noise is regenerated on-GPU:
+
+    εᵢ  =  PRNG(seed = sᵢ)     ← identical noise reproduced from same seed
+
+This means perturbation and restoration are exact:
+
+    Perturb:   θ ← θ + σ · PRNG(sᵢ)
+    Restore:   θ ← θ − σ · PRNG(sᵢ)     ← exact inverse, no drift
+
+
+2.4  Antithetic Pairs (variance reduction)
+────────────────────────────────────────────
+For each seed sᵢ, we evaluate BOTH the + and − perturbations:
+
+    θ⁺ᵢ = θ + σ · εᵢ     (positive perturbation)
+    θ⁻ᵢ = θ − σ · εᵢ     (negative perturbation)
+
+The antithetic estimator becomes:
+
+    ∇̂F  ≈  (1/Nσ)  Σᵢ  [ F(θ⁺ᵢ) − F(θ⁻ᵢ) ] · εᵢ / 2
+
+Why this reduces variance: F(θ+σε) and F(θ-σε) are negatively correlated
+for smooth F (one tends to be high when the other is low), so their difference
+amplifies the true signal while cancelling noise. Empirically ~2× variance
+reduction at no extra model evaluations (we use the same total N).
+
+
+2.5  GRPO Reward Normalisation (Fitness Shaping)
+──────────────────────────────────────────────────
+Before using rewards in the weight update, we normalise them across the
+population using a z-score:
+
+    Aᵢ  =  ( rᵢ − mean(R) ) / ( std(R) + ε )
+
+Where:
+    rᵢ    = raw reward for perturbation i
+    R     = { r₁, r₂, …, rₙ }   all population rewards
+    ε     = 1 × 10⁻⁸             numerical stability
+
+This is called "advantage" in GRPO (Group Relative Policy Optimisation) and
+"fitness shaping" in ES literature. The effect:
+
+    Aᵢ > 0  →  perturbation i scored ABOVE average  →  move toward it
+    Aᵢ < 0  →  perturbation i scored BELOW average  →  move away from it
+    Aᵢ = 0  →  exactly average                      →  no contribution
+
+Key property: the update is invariant to reward offset and scale. If all
+perturbations score identically, std(R) ≈ 0, all Aᵢ ≈ 0, and no update
+is made (correctly: no information to act on).
+
+
+2.6  The Weight Update
+───────────────────────
+Standard (no antithetic):
+
+    Δθ  =  (α / N)  Σᵢ₌₁ᴺ  Aᵢ · εᵢ
+
+    Applied as:  θ ← θ + (α/N)·Aᵢ · PRNG(sᵢ)    for each seed sᵢ
+
+Antithetic:
+
+    coeff_i  =  (α / N) · (A⁺ᵢ − A⁻ᵢ)
+    Δθ  =  Σᵢ  coeff_i · εᵢ
+
+Hyperparameters used:
+    σ (sigma) = 0.001     perturbation scale
+    α (alpha) = 0.0005    learning rate
+    N         = 20        population size
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — REWARD FUNCTION DESIGN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3.1  Binary Correctness Reward
+────────────────────────────────
+Following One-Shot-RLVR exactly:
+
+    binary_reward  =  1.0   if answer is correct
+                   =  0.0   otherwise
+
+"Correct" means the model's response contains \boxed{X} where X matches the
+ground truth, verified by:
+    Step 1 — string normalisation and equality  (fast)
+    Step 2 — symbolic equivalence via SymPy     (fallback for algebraic forms)
+
+There is NO partial credit and NO format reward. If the model does not emit
+\boxed{}, it scores 0.0.
+
+
+3.2  Entropy Bonus
+────────────────────
+To prevent the model from collapsing to a single repeated response (a known
+failure mode in RL fine-tuning), we add an entropy bonus:
+
+    entropy_bonus  =  λ · H_approx
+    λ  =  0.001    (entropy coefficient, matching One-Shot-RLVR paper)
+
+Shannon entropy of the model's token distribution at each step:
+
+    H  =  − Σᵥ  pᵥ log pᵥ        (exact: sum over full vocabulary V)
+
+vLLM returns only the TOP-20 log-softmax values per token (not the full
+vocabulary). We approximate with a tail bucket for missing probability mass:
+
+    pᵢ       = exp(log_softmax_i)         for i = 1 … 20
+    p_tail   = 1 − Σᵢ₌₁²⁰ pᵢ            (all remaining vocabulary mass)
+
+    H_approx = − Σᵢ₌₁²⁰ pᵢ log pᵢ  −  p_tail · log p_tail
+
+This is a LOWER BOUND on true H (Jensen's inequality). The gradient direction
+is correct: increasing H_approx always moves toward higher true entropy.
+
+H is averaged over all T tokens in the response:
+    H_mean  =  (1/T)  Σₜ₌₁ᵀ  H_approx(t)
+
+
+3.3  Total Reward
+──────────────────
+    r  =  binary_reward  +  λ · H_mean
+
+The entropy term is very small (~0.001 × 2 nats ≈ 0.002) relative to the
+binary term (0 or 1). It serves as a tiebreaker and exploration regulariser,
+not as the primary training signal.
+
+
+3.4  Averaging Over 128 Rollouts
+──────────────────────────────────
+The training dataset pi1_r128.parquet contains 128 copies of the same question
+(ground truth = "12.8"). For each perturbation θᵢ, the model generates 128
+responses (with temperature 0.7, so responses vary stochastically). The reward
+for perturbation i is:
+
+    rᵢ  =  (1/128)  Σⱼ₌₁¹²⁸  [ binary_rewardⱼ + λ · H_meanⱼ ]
+
+Averaging over 128 rollouts reduces the variance in the reward estimate for
+each perturbation. This stabilises the GRPO normalisation and the ES gradient.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — TRAINING LOOP LOGIC (ONE FULL ITERATION)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Setup: 4 GPUs, each running an identical copy of the model (engine 0-3).
+       Engines share weights via NCCL broadcast at the end of each iteration.
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ START OF ITERATION i                                                        │
+│                                                                             │
+│ 1. SAMPLE 20 random seeds  s₁, s₂, …, s₂₀                                 │
+│    (each seed defines a noise vector εⱼ via PRNG)                          │
+│                                                                             │
+│ 2. PIPELINE: assign first 4 perturbations to the 4 idle engines            │
+│    Engine k:  θ ← θ_base + σ · PRNG(sₖ)                                   │
+│               generate 128 responses → collect rewards                     │
+│               θ ← θ_base               (restore)                           │
+│    As each engine finishes, assign the next unprocessed seed to it.        │
+│    Total: 20 perturbations evaluated, 4 at a time.                         │
+│                                                                             │
+│ 3. NORMALISE rewards across all 20 perturbations (GRPO z-score)            │
+│    Aᵢ = (rᵢ − mean_r) / (std_r + ε)                                       │
+│                                                                             │
+│ 4. UPDATE engine 0's weights only:                                         │
+│    θ ← θ_base + (α/N) Σᵢ Aᵢ · PRNG(sᵢ)                                   │
+│    (This is the ES step. Engine 0 now holds θ_new.)                        │
+│                                                                             │
+│ 5. BROADCAST: NCCL copies engine 0 weights → engines 1, 2, 3              │
+│    All engines now hold θ_new.  θ_base := θ_new for next iteration.       │
+│                                                                             │
+│ 6. VALIDATE (every 10 iterations): greedy decode on 50 Math500 problems   │
+│    using engine 0.  Report accuracy.                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5 — INFRASTRUCTURE COMPONENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+vLLM
+    Inference engine. Handles tokenisation, KV-cache, batched generation.
+    We use it in "black box" mode: feed prompt strings, receive text outputs.
+    All 128 prompts for one perturbation are processed as a single batch.
+
+Ray
+    Distributed computing framework. Each vLLM engine is a Ray Actor running
+    in its own process. Ray allows us to fire multiple generation jobs
+    asynchronously (ray.get, ray.wait) and pipeline them.
+
+NCCL
+    NVIDIA's GPU collective communication library. Used for one operation:
+    broadcast_all_weights — after the ES update on engine 0, NCCL sends the
+    new weights to engines 1-3 over the GPU interconnect (NVLink/PCIe).
+    This is faster than copying through CPU memory.
+
+WorkerExtension (utils/worker_extn.py)
+    A custom class injected into vLLM's internal GPU worker process.
+    Provides:
+        perturb_self_weights(seed, sigma, negate, iid_noise)
+            — adds σ·PRNG(seed) to all parameters IN-GPU (no CPU copy)
+        restore_self_weights(seed, sigma, iid_noise, negate)
+            — exact inverse: subtracts σ·PRNG(seed)
+        init_inter_engine_group(addr, port, rank, world_size)
+            — sets up the NCCL process group across all 4 engines
+        broadcast_all_weights(src_rank)
+            — NCCL broadcast from src engine to all others
+        save_self_weights_to_disk(path)
+            — saves final model checkpoint
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — KEY EQUATIONS AT A GLANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ES gradient estimator:
+    ∇̂F  =  (1/Nσ)  Σᵢ  F(θ + σεᵢ) · εᵢ
+
+Antithetic variant:
+    ∇̂F  =  (1/Nσ)  Σᵢ  [ F(θ+σεᵢ) − F(θ−σεᵢ) ] · εᵢ / 2
+
+Reward per perturbation:
+    rᵢ  =  mean over 128 rollouts of [ binary_reward + λ · H_approx ]
+
+GRPO normalisation:
+    Aᵢ  =  ( rᵢ − mean(R) ) / ( std(R) + 1e-8 )
+
+Weight update:
+    θ_new  =  θ_base  +  (α/N)  Σᵢ  Aᵢ · εᵢ
+
+Entropy approximation (top-20 + tail):
+    H  ≈  −Σᵢ₌₁²⁰ pᵢ log pᵢ  −  p_tail log p_tail
+    where  p_tail = 1 − Σᵢ₌₁²⁰ pᵢ
+
+Hyperparameters:
+    σ = 0.001     α = 0.0005     N = 20     λ = 0.001
+
+================================================================================

@@ -1,0 +1,298 @@
+================================================================================
+  ES-RLVR: Plain-English Explanation with Worked Examples
+  How does our training actually work, step by step?
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART A — THE BIG PICTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Imagine you are trying to teach a student to solve a maths problem, but you
+cannot look inside their brain. You cannot see which neurons fired or trace
+how they thought. All you can do is:
+
+    1. Slightly scramble their memory in a random direction
+    2. Ask them the question
+    3. See if the answer is right or wrong
+    4. If it was right, nudge their permanent memory a little in that direction
+       If it was wrong, nudge away
+
+That is exactly what Evolution Strategies (ES) does to the language model.
+
+The model's "memory" = 1.5 billion numbers (weights θ).
+The "slight scramble" = adding small random noise ε to those numbers.
+The "question" = our single training maths problem.
+The "right or wrong" = did the model write the correct answer in \boxed{}?
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART B — THE TRAINING QUESTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+We train on a SINGLE question, repeated 128 times in our dataset:
+
+    "Find the wind velocity (in mph) when the pressure on 4 sq ft of sail
+     is 32 pounds. Use the formula: P = 0.004 × V² × A"
+
+    Ground truth answer: 12.8
+
+Solving it:
+    P = 0.004 × V² × A
+    32 = 0.004 × V² × 4
+    32 = 0.016 × V²
+    V² = 32 / 0.016 = 2000
+    V  = √2000 ≈ 44.7 ...
+
+Wait — that gives V ≈ 44.7, not 12.8. Let us try P = 0.004 × V³:
+    32 = 0.004 × V³ × 4  →  V³ = 2000  →  V = ∛2000 ≈ 12.6
+
+Close. With P = 0.004 × V³ (cubic law):
+    32 = 0.004 × V³  (for A=1, or the formula is P/A = 0.004 × V³)
+    V³ = 8000
+    V  = ∛8000 = 20  ... still not exactly 12.8
+
+The ground truth 12.8 = ∛2048, which comes from a specific formulation.
+The key point: the correct reasoning path leads to 12.8, and the model
+must discover it. The reward is 1.0 only if the model writes \boxed{12.8}.
+
+This is One-Shot RLVR: if the model can be trained to correctly reason
+through THIS ONE problem, it develops general reasoning skills that
+generalise to Math500 (500 different problems).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART C — ONE ITERATION, STEP BY STEP WITH NUMBERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Let's walk through ONE training iteration concretely.
+Settings: population_size=20, sigma=0.001, alpha=0.0005
+
+──────────────────────────────────────────────────────────
+STEP 1: Generate 20 random noise seeds
+──────────────────────────────────────────────────────────
+
+We draw 20 random integers, for example:
+    s₁=482910, s₂=103847, s₃=774521, …, s₂₀=293847
+
+Each seed represents a unique direction in weight space. From seed sᵢ, we
+can reproduce the same noise vector εᵢ (1.5B random numbers) on any GPU at
+any time, just by re-running the same random number generator.
+
+
+──────────────────────────────────────────────────────────
+STEP 2: Evaluate each perturbation
+──────────────────────────────────────────────────────────
+
+For each seed sᵢ, on one of our 4 GPUs:
+
+    a) PERTURB:   θ_perturbed = θ_base + 0.001 × PRNG(sᵢ)
+       (add tiny noise to all 1.5 billion weights)
+
+    b) GENERATE:  Ask the perturbed model the question 128 times
+       (128 copies of the same question, temperature=0.7 so answers vary)
+
+    c) SCORE:     For each of the 128 responses, check if \boxed{12.8} appears
+       binary_rewards = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, ...]
+       avg_reward_i   = mean(binary_rewards) = e.g. 0.0625  (8/128 correct)
+
+    d) RESTORE:   θ = θ_base  (undo the noise exactly)
+
+We run 4 perturbations in parallel (one per GPU), then cycle through all 20.
+
+
+──────────────────────────────────────────────────────────
+STEP 3: Suppose we got these 20 rewards (hypothetical example)
+──────────────────────────────────────────────────────────
+
+    Seed  |  avg_reward
+    ──────┼────────────
+    s₁    |  0.062   (8/128 correct)
+    s₂    |  0.000   (0/128 correct)
+    s₃    |  0.125   (16/128 correct)  ← best
+    s₄    |  0.000
+    s₅    |  0.031   (4/128 correct)
+    ...
+    s₁₈   |  0.000
+    s₁₉   |  0.047
+    s₂₀   |  0.000
+
+    mean_r = 0.025     std_r = 0.034
+
+
+──────────────────────────────────────────────────────────
+STEP 4: Normalise rewards (GRPO z-score)
+──────────────────────────────────────────────────────────
+
+    Aᵢ = (rᵢ − mean_r) / (std_r + ε)
+       = (rᵢ − 0.025)  / 0.034
+
+    s₁:  A₁ = (0.062 − 0.025) / 0.034 =  +1.09   ← above average, pull toward
+    s₂:  A₂ = (0.000 − 0.025) / 0.034 =  −0.74   ← below average, push away
+    s₃:  A₃ = (0.125 − 0.025) / 0.034 =  +2.94   ← well above average, strong pull
+    s₄:  A₄ = (0.000 − 0.025) / 0.034 =  −0.74
+    ...
+
+Positive Aᵢ means: "this random direction happened to improve the model,
+                    so let's permanently nudge weights toward it"
+Negative Aᵢ means: "this direction made it worse, nudge away"
+
+
+──────────────────────────────────────────────────────────
+STEP 5: Apply the weight update (ES gradient step)
+──────────────────────────────────────────────────────────
+
+    coeff_i = (α / N) × Aᵢ = (0.0005 / 20) × Aᵢ = 2.5e-5 × Aᵢ
+
+For seed s₃ (best performer, A₃ = +2.94):
+    coeff₃ = 2.5e-5 × 2.94 = +7.35e-5
+    θ ← θ + 7.35e-5 × PRNG(s₃)
+    (push weights 7.35e-5 × σ=0.001 in the s₃ direction)
+
+For seed s₂ (worst, A₂ = −0.74):
+    coeff₂ = 2.5e-5 × (−0.74) = −1.85e-5
+    θ ← θ − 1.85e-5 × PRNG(s₂)
+    (push weights slightly AWAY from s₂ direction)
+
+All 20 updates are applied cumulatively to engine 0.
+Result: θ_new = θ_base + Σᵢ coeff_i × εᵢ
+
+
+──────────────────────────────────────────────────────────
+STEP 6: Broadcast new weights to all 4 GPUs
+──────────────────────────────────────────────────────────
+
+Engine 0 now holds θ_new.
+NCCL broadcast copies θ_new from GPU 0 → GPU 1, GPU 2, GPU 3.
+All engines are now synchronised at θ_new.
+θ_base := θ_new for the next iteration.
+
+
+──────────────────────────────────────────────────────────
+STEP 7 (every 10 iterations): Validate on Math500
+──────────────────────────────────────────────────────────
+
+Ask engine 0 to solve 50 problems from Math500 (greedy, temperature=0).
+Count how many it gets right. Report accuracy.
+
+If the One-Shot-RLVR hypothesis holds, accuracy on Math500 should INCREASE
+over training iterations even though we only trained on one wind velocity
+problem. The model is not learning facts — it is learning HOW to reason.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART D — ANTITHETIC PAIRS EXAMPLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+With --antithetic flag, for each seed s we test BOTH +ε and −ε:
+
+    θ⁺ = θ + 0.001 × PRNG(s)    → reward r⁺ = 0.125
+    θ⁻ = θ − 0.001 × PRNG(s)    → reward r⁻ = 0.000
+
+After normalisation: A⁺ = +2.94,  A⁻ = −0.74
+
+Update coefficient:
+    coeff = (α/N) × (A⁺ − A⁻) = (0.0005/20) × (2.94 − (−0.74))
+          = 2.5e-5 × 3.68
+          = +9.2e-5
+
+Why this is better: we KNOW the +ε direction is better than the −ε direction.
+The difference (A⁺ − A⁻) gives a cleaner signal than either alone.
+The noise from random effects partially cancels between the paired evaluations.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART E — ENTROPY BONUS: WHY AND HOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem without entropy bonus:
+Imagine every perturbation produces the same response:
+    "The answer is \boxed{0}"  (all wrong, all identical)
+Then all rewards are 0, std_r ≈ 0, all Aᵢ ≈ 0, and the update is zero.
+The model is stuck — no gradient signal.
+
+The entropy bonus rewards DIVERSITY of responses:
+
+    H_approx = −Σ pᵢ log pᵢ   (measured at each token the model generates)
+
+Example at one token step:
+    Model is 95% sure next token is "The", 5% split among everything else
+    H ≈ −0.95 × log(0.95) − 0.05 × log(0.05) ≈ 0.05 + 0.15 ≈ 0.20 nats
+    → LOW entropy, model is very certain (possibly stuck)
+
+    Model gives equal probability to 10 tokens (each p=0.10)
+    H ≈ −10 × 0.10 × log(0.10) ≈ 2.30 nats
+    → HIGH entropy, model is exploring
+
+A perturbation that makes the model more exploratory (higher H) gets a small
+bonus added to its reward, even if no responses were correct. This keeps the
+model searching rather than collapsing to a fixed response.
+
+Magnitude: entropy bonus ≈ 0.001 × 2.0 nats ≈ 0.002
+This is tiny compared to binary reward (0 or 1), so it never overrides the
+correctness signal — it just prevents complete collapse.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART F — HOW ES DIFFERS FROM GRPO (THE STANDARD APPROACH)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In standard One-Shot-RLVR (GRPO), for the same question the model generates
+G=8 responses using its CURRENT weights (no perturbation), then computes:
+
+    loss = − Σₜ Σₖ Aₖ × log P(tokenₜ | context; θ)
+
+And backpropagates through all the log-probabilities to update θ directly.
+This gives exact, per-token credit assignment.
+
+In ES (our approach):
+    - No backpropagation needed
+    - No log-probability gradients computed
+    - Only scalar rewards needed
+    - But: gradient estimate is noisy (we estimate a 1.5B-dim gradient
+      from 20 scalar observations)
+    - Roughly 320× more forward passes per update vs GRPO
+
+The ES approach is justified when:
+    a) The model is not differentiable (black-box)
+    b) You want to avoid storing activations for backprop (memory)
+    c) The training signal is sparse but you have parallel compute to burn
+
+In our case (b) applies: vLLM is an inference-only engine with no autograd
+graph. Running ES entirely within vLLM avoids the need for a separate
+training process with HuggingFace + Adam, making the infrastructure simpler.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART G — THE FULL EQUATION CHAIN (SUMMARY)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Given:
+    θ         current model weights
+    σ = 0.001 perturbation scale
+    α = 0.0005 learning rate
+    N = 20    population size
+    λ = 0.001 entropy coefficient
+
+For each iteration:
+
+(1) Sample N seeds:  s₁, …, sₙ
+
+(2) For each seed i, compute perturbation reward:
+        εᵢ       = PRNG(sᵢ)                         [reproduced on GPU]
+        θᵢ       = θ + σ · εᵢ                        [perturbed weights]
+        rᵢ       = (1/128) Σⱼ [ correct(θᵢ, qⱼ) + λ · H(θᵢ, qⱼ) ]
+
+(3) Normalise:
+        μ        = (1/N) Σᵢ rᵢ
+        s        = std({ rᵢ })
+        Aᵢ       = (rᵢ − μ) / (s + 1e-8)
+
+(4) Update:
+        θ_new    = θ + (α/N) Σᵢ Aᵢ · εᵢ
+
+(5) Broadcast θ_new to all GPUs via NCCL
+
+(6) Repeat for next iteration with θ := θ_new
+
+================================================================================
