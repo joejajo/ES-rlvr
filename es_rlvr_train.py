@@ -129,8 +129,8 @@ def parse_args():
     parser.add_argument("--alpha", type=float, default=ALPHA)
     parser.add_argument("--population_size", type=int, default=POPULATION_SIZE)
     parser.add_argument("--antithetic", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="Use antithetic (±ε) pairs (default: True).")
+                        default=False,
+                        help="Use antithetic (±ε) pairs (default: False).")
     parser.add_argument("--iid_noise", action="store_true", default=False,
                         help="Independent noise per parameter (vs shared noise).")
     # Reward
