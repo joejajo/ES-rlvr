@@ -284,7 +284,7 @@ def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
         temperature=temperature,
         seed=42,
         max_tokens=max_tokens,
-        logprobs=100,        # top-100 for Shannon entropy approximation
+        logprobs=20,         # top-20 for Shannon entropy approximation (vLLM max)
     )
     handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
     return handle, time.time()
@@ -302,7 +302,7 @@ def _extract_boxed(text: str):
 
 def _compute_token_entropy(output_obj) -> tuple:
     """
-    Average per-token Shannon entropy from vLLM top-100 logprobs.
+    Average per-token Shannon entropy from vLLM top-20 logprobs.
 
     Matches the One-Shot-RLVR / verl formula:
         H = logsumexp(X) − Σ_v p_v X_v  =  −Σ_v p_v log p_v
@@ -316,7 +316,7 @@ def _compute_token_entropy(output_obj) -> tuple:
     Returns:
         (mean_entropy, mean_coverage) over response tokens.
         mean_coverage tracks what fraction of probability mass is in top-k
-        — use this to verify top-100 is sufficient for your model.
+        — use this to verify top-20 is sufficient for your model.
     """
     completion = output_obj.outputs[0]
     if not getattr(completion, "logprobs", None):
