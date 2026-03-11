@@ -25,7 +25,7 @@ No optimizer state, no autograd — weight updates happen directly inside the in
 
 **One-Shot-RLVR** — Yupeng Wang et al.
 The core insight (single-example training, binary reward, z-score normalisation, entropy bonus) comes entirely from their work.
-- Paper: [arXiv 2501.12599](https://arxiv.org/abs/2501.12599)
+- Paper: [arXiv 2501.12599]([https://arxiv.org/abs/2501.12599](https://arxiv.org/abs/2504.20571))
 - Code: [ypwang61/One-Shot-RLVR](https://github.com/ypwang61/One-Shot-RLVR)
 
 **ES Fine-Tuning (VsonicV)** — the vLLM + Ray + NCCL architecture and `WorkerExtension` pattern used here is based on:
