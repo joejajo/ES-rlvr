@@ -910,20 +910,17 @@ def main(args):
             w.writerow(csv_row)
 
         # ── ES weight update on engine 0 ──────────────────────────────────────
-        # Antithetic: Δθ += (α/(N×σ)) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
-        # Standard:   Δθ += (α/(N×σ)) × Aᵢ × εᵢ
-        # Dividing by σ is required because perturbations were drawn as σ×εᵢ;
-        # the unbiased ES gradient estimator is (1/Nσ) Σ Aᵢ εᵢ.
+        # Antithetic: Δθ += (α/N) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
+        # Standard:   Δθ += (α/N) × Aᵢ × εᵢ
         perturb_start = time.time()
         handles = []
-        base_coeff = args.alpha / (args.population_size * args.sigma)
 
         if args.antithetic:
             for s in base_seeds:
                 norm_pos = seeds_perf.get((s, False), {}).get("norm_reward", 0.0)
                 norm_neg = seeds_perf.get((s, True),  {}).get("norm_reward", 0.0)
-                # Combined antithetic coefficient: (A⁺ − A⁻) / (N×σ) × α
-                coeff = base_coeff * (norm_pos - norm_neg)
+                # Combined antithetic coefficient: (A⁺ − A⁻) / N × α
+                coeff = (args.alpha / args.population_size) * (norm_pos - norm_neg)
                 if coeff != 0.0:
                     handles.append(engines[0].collective_rpc.remote(
                         "perturb_self_weights",
@@ -932,7 +929,7 @@ def main(args):
         else:
             for s, neg in seed_tasks:
                 norm  = seeds_perf.get((s, neg), {}).get("norm_reward", 0.0)
-                coeff = base_coeff * norm
+                coeff = (args.alpha / args.population_size) * norm
                 if coeff != 0.0:
                     handles.append(engines[0].collective_rpc.remote(
                         "perturb_self_weights",
