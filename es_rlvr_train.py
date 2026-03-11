@@ -115,7 +115,7 @@ def parse_args():
     )
     # Model
     parser.add_argument("--model_name", type=str,
-                        default="Qwen/Qwen2.5-Math-1.5B-Instruct")
+                        default="Qwen/Qwen2.5-Math-1.5B")
     # Data
     parser.add_argument("--parquet_path", type=str,
                         default="Dataset parquet/pi1_r128.parquet",
@@ -273,7 +273,7 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
-                    max_tokens: int = 2048):
+                    max_tokens: int = 3072):
     """
     Launch an async vLLM generation on llm.
     logprobs=1 → per-token logprob of the sampled token, used as entropy proxy.
@@ -450,7 +450,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     """
     batch = val_task_datas[:val_batch_size]
     prompts = [d["prompt_str"] for d in batch]
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=2048)
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=3072)
 
     print(f"\n{'#' * 70}")
     print(f"  [VAL] Iter {iteration} — Math500 greedy eval on {len(batch)} examples")
