@@ -30,12 +30,13 @@ class WorkerExtension:
             torch.cuda.synchronize()
         return True
 
-    def restore_self_weights(self, seed, sigma, iid_noise=False):
+    def restore_self_weights(self, seed, sigma, iid_noise=False, negate=False):
+        sign = 1.0 if negate else -1.0  # undo: +ε needs subtract, -ε needs add
         for param_idx, (_, p) in enumerate(self.model_runner.model.named_parameters()):
             gen = torch.Generator(device=p.device)
             gen.manual_seed(self._noise_seed(seed, param_idx, iid_noise))
             noise = torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
-            p.data.add_(-float(sigma) * noise)
+            p.data.add_(sign * float(sigma) * noise)
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()

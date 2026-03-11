@@ -814,11 +814,11 @@ def main(args):
                 "time":            elapsed,
             })
 
-            # Restore engine weights
+            # Restore engine weights (pass negate so -ε perturbations are correctly undone)
             llm = meta["engine"]
             ray.get(llm.collective_rpc.remote(
                 "restore_self_weights",
-                args=(meta["seed"], args.sigma, args.iid_noise),
+                args=(meta["seed"], args.sigma, args.iid_noise, meta["negate"]),
             ))
 
             # Schedule next seed on this engine
