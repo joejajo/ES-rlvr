@@ -35,8 +35,13 @@ import signal
 import sys
 import time
 
-# Allow imports from parent repo (utils/, deepscaler.py)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Allow imports from same directory or parent repo (utils/, deepscaler.py).
+# Works whether the script is placed in a subfolder OR at the repo root.
+_here = os.path.dirname(os.path.abspath(__file__))
+for _candidate in (_here, os.path.dirname(_here)):
+    if os.path.isfile(os.path.join(_candidate, "deepscaler.py")):
+        sys.path.insert(0, _candidate)
+        break
 
 import matplotlib
 matplotlib.use("Agg")
