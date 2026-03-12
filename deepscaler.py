@@ -39,12 +39,8 @@ except ImportError:
             return str(model_answer).strip() == str(ground_truth).strip()
 
 
-# System prompt injected into every query to encourage \boxed{} format.
-SYSTEM_PROMPT = (
-    "You are a mathematical reasoning assistant. "
-    "Always solve step by step and put your final answer inside \\boxed{}, for example \\boxed{42}. "
-    "Do not skip the \\boxed{} - answers without it will not be graded."
-)
+# System prompt — matches One-Shot-RLVR / qwen25-math-cot exactly.
+SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
 
 
 def _is_numeric_match(a, b, tol=1e-6):
