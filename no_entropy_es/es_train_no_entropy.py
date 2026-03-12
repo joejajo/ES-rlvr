@@ -289,12 +289,16 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 
 def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
                     max_tokens: int = 3072):
-    """Launch async vLLM generation. No logprobs — pure binary reward."""
+    """
+    Launch async vLLM generation.
+    logprobs=20 for One-Shot-RLVR entropy tracking (monitoring only — NOT used in reward).
+    """
     prompts = [d["prompt_str"] for d in task_datas]
     sampling_params = SamplingParams(
         temperature=temperature,
         seed=42,
         max_tokens=max_tokens,
+        logprobs=20,     # top-20 for entropy monitoring (One-Shot-RLVR formula)
     )
     handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
     return handle, time.time()
@@ -309,29 +313,93 @@ def _extract_boxed(text: str):
     return matches[-1].strip() if matches else None
 
 
+def _compute_token_entropy(output_obj) -> tuple:
+    """
+    Average per-token Shannon entropy from vLLM top-20 logprobs.
+
+    Exact One-Shot-RLVR / verl formula:
+        H = −Σ_v p_v log p_v
+
+    Approximated with top-k log-softmax values returned by vLLM:
+        H_approx = −Σ_{i=1}^{k} p_i log p_i  −  p_tail log p_tail
+
+    where p_tail = 1 − Σ p_i accounts for remaining probability mass.
+
+    NOTE: result is tracked as a METRIC ONLY — it is never added to the
+    reward signal.  This lets you compare entropy curves between this run
+    (pure binary) and the entropy-bonus run side by side.
+
+    Returns:
+        (mean_entropy, mean_coverage) over response tokens.
+    """
+    completion = output_obj.outputs[0]
+    if not getattr(completion, "logprobs", None):
+        return 0.0, 0.0
+
+    token_entropies = []
+    coverages = []
+
+    for lp_dict in completion.logprobs:
+        if not lp_dict:
+            continue
+        log_probs = []
+        for lp_val in lp_dict.values():
+            lp = lp_val.logprob if hasattr(lp_val, "logprob") else float(lp_val)
+            log_probs.append(lp)
+        if not log_probs:
+            continue
+
+        log_probs_arr = np.array(log_probs, dtype=np.float64)
+        probs = np.exp(log_probs_arr)
+
+        covered = float(np.sum(probs))
+        covered = min(max(covered, 0.0), 1.0)
+        tail = max(0.0, 1.0 - covered)
+
+        h = float(-np.sum(probs * log_probs_arr))
+        if tail > 1e-9:
+            h += float(-tail * np.log(tail))
+
+        token_entropies.append(h)
+        coverages.append(covered)
+
+    mean_h   = float(np.mean(token_entropies)) if token_entropies else 0.0
+    mean_cov = float(np.mean(coverages))       if coverages       else 0.0
+    return mean_h, mean_cov
+
+
 def _postprocess_outputs(outputs, task_datas: list,
                          debug_print: bool = False) -> dict:
     """
-    Compute per-sample binary rewards.
+    Compute per-sample binary rewards + entropy monitoring.
 
     Reward design (pure binary):
       total = binary_reward    (1.0 or 0.0)
 
-    No entropy bonus, no logprobs.
+    Entropy is computed with the One-Shot-RLVR formula (top-20 logprobs +
+    tail bucket) but is NEVER added to the reward — monitoring only.
 
     Returns:
       scores             — list of binary rewards (used for ES normalisation)
-      correctness_scores — same as scores (no separate tracking needed)
+      correctness_scores — same as scores
       avg_reward         — mean binary reward
       avg_correctness    — same as avg_reward
+      avg_entropy        — mean per-token Shannon entropy (monitoring)
+      avg_coverage       — mean top-20 probability mass coverage (monitoring)
       first_sample       — dict for train_outputs.csv
     """
     correctness_scores = []
+    entropy_vals = []
+    coverage_vals = []
 
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
         completion = output.outputs[0].text
         binary_reward = compute_training_score(completion, data["ground_truth"])
+        ent, cov = _compute_token_entropy(output)
+
         correctness_scores.append(binary_reward)
+        entropy_vals.append(ent)
+        coverage_vals.append(cov)
 
         if debug_print and idx == 0:
             boxed = _extract_boxed(completion)
@@ -350,6 +418,7 @@ def _postprocess_outputs(outputs, task_datas: list,
             print(f"  Ground Truth    : {data['ground_truth']}")
             print(f"  Extracted Answer: {boxed if boxed else '(none — no \\boxed{})'}")
             print(f"  Result          : {correct_str}  (binary={binary_reward:.1f})")
+            print(f"  Entropy (monitor): {ent:.4f}  coverage={cov:.4f}  [NOT used in reward]")
             print("=" * 70 + "\n")
 
     first = {}
@@ -360,6 +429,7 @@ def _postprocess_outputs(outputs, task_datas: list,
         first["extracted_answer"] = os_extract_answer(first_completion, "math500")
         first["ground_truth"]     = task_datas[0].get("ground_truth", "")
         first["binary_reward"]    = correctness_scores[0] if correctness_scores else 0.0
+        first["entropy_monitor"]  = entropy_vals[0]       if entropy_vals       else 0.0
 
     avg = float(np.mean(correctness_scores)) if correctness_scores else 0.0
     return {
@@ -367,6 +437,8 @@ def _postprocess_outputs(outputs, task_datas: list,
         "correctness_scores": correctness_scores,
         "avg_reward":         avg,
         "avg_correctness":    avg,
+        "avg_entropy":        float(np.mean(entropy_vals))  if entropy_vals  else 0.0,
+        "avg_coverage":       float(np.mean(coverage_vals)) if coverage_vals else 0.0,
         "first_sample":       first,
     }
 
@@ -511,15 +583,13 @@ def save_plots(history: dict, output_dir: str):
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # Bottom-right: fraction of population that got correct answer each iter
+    # Bottom-right: entropy monitor (One-Shot-RLVR formula) — NOT used in reward
     ax = axes[1, 1]
-    ax.plot(iters, history["train_correctness"],
-            color="tab:red", linewidth=1.5, label="% correct in population")
+    ax.plot(iters, history["entropy_monitor"],
+            color="tab:purple", linewidth=1.5, label="H (top-20 + tail, monitor only)")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("Fraction Correct")
-    ax.set_title("Population Correctness Rate")
-    ax.set_ylim(-0.05, 1.10)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+    ax.set_ylabel("Shannon entropy  H (nats/token)")
+    ax.set_title("Response Token Entropy [monitor only — NOT in reward]")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -633,6 +703,8 @@ def main(args):
         "train_correctness":  [],
         "reward_mean":        [],
         "reward_std":         [],
+        "entropy_monitor":    [],   # One-Shot-RLVR entropy formula, monitoring only
+        "entropy_coverage":   [],
         "val_iter":           [],
         "val_accuracy":       [],
     }
@@ -654,12 +726,14 @@ def main(args):
         with open(csv_path, "w", newline="") as f:
             import csv as _csv
             w = _csv.DictWriter(f, fieldnames=[
-                "iter", "train_correctness", "reward_mean", "reward_std", "val_accuracy",
+                "iter", "train_correctness", "reward_mean", "reward_std",
+                "entropy_monitor", "entropy_coverage", "val_accuracy",
             ])
             w.writeheader()
             w.writerow({
                 "iter": "baseline", "train_correctness": "",
-                "reward_mean": "", "reward_std": "", "val_accuracy": baseline_acc,
+                "reward_mean": "", "reward_std": "",
+                "entropy_monitor": "", "entropy_coverage": "", "val_accuracy": baseline_acc,
             })
         csv_header_written = True
 
@@ -728,6 +802,8 @@ def main(args):
                 "negate":          meta["negate"],
                 "avg_reward":      metrics["avg_reward"],
                 "avg_correctness": metrics["avg_correctness"],
+                "avg_entropy":     metrics["avg_entropy"],
+                "avg_coverage":    metrics["avg_coverage"],
                 "time":            elapsed,
             })
 
@@ -761,12 +837,17 @@ def main(args):
         # ── GRPO / ES reward normalisation ────────────────────────────────────
         all_rewards     = [v["avg_reward"]      for v in seeds_perf.values()]
         all_correctness = [v["avg_correctness"] for v in seeds_perf.values()]
+        all_entropy     = [v["avg_entropy"]     for v in seeds_perf.values()]
+        all_coverage    = [v["avg_coverage"]    for v in seeds_perf.values()]
 
-        mean_r = float(np.mean(all_rewards))      if all_rewards     else 0.0
-        std_r  = float(np.std(all_rewards))       if all_rewards     else 0.0
-        mean_c = float(np.mean(all_correctness))  if all_correctness else 0.0
+        mean_r   = float(np.mean(all_rewards))      if all_rewards     else 0.0
+        std_r    = float(np.std(all_rewards))       if all_rewards     else 0.0
+        mean_c   = float(np.mean(all_correctness))  if all_correctness else 0.0
+        mean_e   = float(np.mean(all_entropy))      if all_entropy     else 0.0
+        mean_cov = float(np.mean(all_coverage))     if all_coverage    else 0.0
 
         print(f"\n[REWARD]  mean={mean_r:.4f}  std={std_r:.4f}  correctness={mean_c:.4f}")
+        print(f"[ENTROPY] H={mean_e:.4f}  coverage={mean_cov:.4f}  (monitor only — NOT in reward)")
 
         for key, v in seeds_perf.items():
             v["norm_reward"] = (v["avg_reward"] - mean_r) / (std_r + 1e-8)
@@ -775,11 +856,15 @@ def main(args):
                 print(f"    seed={s} {'(-)' if neg else '(+)'}: "
                       f"reward={v['avg_reward']:.4f}  "
                       f"norm={v['norm_reward']:.4f}  "
-                      f"correct={v['avg_correctness']:.4f}")
+                      f"correct={v['avg_correctness']:.4f}  "
+                      f"ent={v['avg_entropy']:.4f}  "
+                      f"cov={v['avg_coverage']:.4f}")
 
-        writer.add_scalar("reward/mean",        mean_r, i)
-        writer.add_scalar("reward/std",         std_r,  i)
-        writer.add_scalar("reward/correctness", mean_c, i)
+        writer.add_scalar("reward/mean",              mean_r,   i)
+        writer.add_scalar("reward/std",               std_r,    i)
+        writer.add_scalar("reward/correctness",       mean_c,   i)
+        writer.add_scalar("entropy_monitor/H",        mean_e,   i)   # One-Shot-RLVR formula, monitor only
+        writer.add_scalar("entropy_monitor/coverage", mean_cov, i)
         if results_this_gen:
             writer.add_scalar(
                 "reward/max_correctness",
@@ -790,12 +875,16 @@ def main(args):
         history["train_correctness"].append(mean_c)
         history["reward_mean"].append(mean_r)
         history["reward_std"].append(std_r)
+        history["entropy_monitor"].append(mean_e)
+        history["entropy_coverage"].append(mean_cov)
 
         csv_row = {
             "iter":              i,
             "train_correctness": mean_c,
             "reward_mean":       mean_r,
             "reward_std":        std_r,
+            "entropy_monitor":   mean_e,
+            "entropy_coverage":  mean_cov,
             "val_accuracy":      "",
         }
         write_mode = "w" if not csv_header_written else "a"
@@ -818,7 +907,7 @@ def main(args):
         _train_csv_mode = "w" if not train_csv_header_written else "a"
         with open(train_outputs_csv, _train_csv_mode, newline="", encoding="utf-8") as _f:
             _train_fields = ["iter", "question", "model_response", "extracted_answer",
-                             "ground_truth", "binary_reward"]
+                             "ground_truth", "binary_reward", "entropy_monitor"]
             _tw = _csv.DictWriter(_f, fieldnames=_train_fields)
             if not train_csv_header_written:
                 _tw.writeheader()
@@ -884,11 +973,13 @@ def main(args):
             with open(csv_path, "a", newline="") as f:
                 import csv as _csv
                 w = _csv.DictWriter(f, fieldnames=[
-                    "iter", "train_correctness", "reward_mean", "reward_std", "val_accuracy",
+                    "iter", "train_correctness", "reward_mean", "reward_std",
+                    "entropy_monitor", "entropy_coverage", "val_accuracy",
                 ])
                 w.writerow({
                     "iter": f"val@{i}", "train_correctness": "",
-                    "reward_mean": "", "reward_std": "", "val_accuracy": val_acc,
+                    "reward_mean": "", "reward_std": "",
+                    "entropy_monitor": "", "entropy_coverage": "", "val_accuracy": val_acc,
                 })
             save_plots(history, logging_dir)
 
