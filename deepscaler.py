@@ -9,8 +9,28 @@ except ImportError:
         def extract_answer(text):
             if text is None:
                 return None
-            match = re.search(r"\\boxed\s*{([^}]*)}", str(text))
-            return match.group(1).strip() if match else None
+            s = str(text)
+            # Find \boxed{ and then use brace-counting to handle nested LaTeX
+            # e.g. \boxed{\frac{14}{3}} — [^}]* regex would stop at the first }
+            idx = s.find(r"\boxed")
+            if idx == -1:
+                return None
+            # advance past \boxed and optional whitespace to the opening brace
+            i = idx + len(r"\boxed")
+            while i < len(s) and s[i] == " ":
+                i += 1
+            if i >= len(s) or s[i] != "{":
+                return None
+            depth = 0
+            start = i + 1  # content starts after the opening brace
+            for j in range(i, len(s)):
+                if s[j] == "{":
+                    depth += 1
+                elif s[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return s[start:j].strip()
+            return None
 
         def grade_answer_sympy(model_answer, ground_truth):
             return str(model_answer).strip() == str(ground_truth).strip()
