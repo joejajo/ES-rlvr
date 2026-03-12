@@ -88,8 +88,8 @@ except ImportError:
             return s.getsockname()[1]
 
 from deepscaler import compute_training_score, SYSTEM_PROMPT
-from utils.os_parser import extract_answer as os_extract_answer, strip_string
-from utils.os_grader import math_equal
+from utils.os_parser import extract_answer as os_extract_answer
+from utils.math500_eval import grade_answer as grade_math500
 
 # ── qwen25-math-cot val prompt (matches One-Shot-RLVR eval exactly) ───────────
 # Template: system + all demos + actual question in one user turn.
@@ -550,9 +550,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     correct = 0.0
     correctness_list = []
     for output, data in zip(outputs, batch):
-        pred = os_extract_answer(output.outputs[0].text, data_name="math500")
-        gt   = strip_string(str(data["ground_truth"]))
-        c    = 1.0 if (pred != "" and math_equal(pred, gt, timeout=False)) else 0.0
+        c    = grade_math500(output.outputs[0].text, data["ground_truth"])
         correct += c
         correctness_list.append(c)
 
@@ -605,7 +603,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
                     "example_idx":      idx,
                     "question":         data.get("question", ""),
                     "model_response":   completion,
-                    "extracted_answer": os_extract_answer(completion, "math500"),
+                    "extracted_answer": os_extract_answer(completion, data_name="math500"),
                     "ground_truth":     data["ground_truth"],
                     "correct":          int(score),
                 })
