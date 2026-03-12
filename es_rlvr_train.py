@@ -91,6 +91,52 @@ from deepscaler import compute_score, SYSTEM_PROMPT
 from utils.os_parser import extract_answer as os_extract_answer, strip_string
 from utils.os_grader import math_equal
 
+# ── qwen25-math-cot val prompt (matches One-Shot-RLVR eval exactly) ───────────
+# Template: system + all demos + actual question in one user turn.
+# 1-shot demo for math500: the wind-pressure problem (same as pi1_r128 train Q).
+_QWEN_COT_SYSTEM = "Please reason step by step, and put your final answer within \\boxed{}."
+_QWEN_COT_1SHOT_Q = (
+    "The pressure \\( P \\) exerted by wind on a sail varies jointly as the area"
+    " \\( A \\) of the sail and the cube of the wind's velocity \\( V \\). When"
+    " the velocity is \\( 8 \\) miles per hour, the pressure on a sail of"
+    " \\( 2 \\) square feet is \\( 4 \\) pounds. Find the wind velocity when the"
+    " pressure on \\( 4 \\) square feet of sail is \\( 32 \\) pounds."
+    " Let's think step by step and output the final answer within \\boxed{}."
+)
+_QWEN_COT_1SHOT_A = (
+    "We start by writing the mathematical relationship for the pressure \\( P \\):\n"
+    "\\[ P = k \\cdot A \\cdot V^3 \\]\n"
+    "where \\( k \\) is a constant. We need to find \\( k \\) using the given information:\n"
+    "\\[ 4 = k \\cdot 2 \\cdot 8^3 \\]\n"
+    "Solving for \\( k \\):\n"
+    "\\[ 4 = k \\cdot 2 \\cdot 512 \\]\n"
+    "\\[ 4 = 1024k \\]\n"
+    "\\[ k = \\frac{4}{1024} \\]\n"
+    "\\[ k = \\frac{1}{256} \\]\n"
+    "Now we use this value of \\( k \\) to find the velocity \\( V \\) when the"
+    " pressure \\( P \\) on 4 square feet of sail is 32 pounds:\n"
+    "\\[ 32 = \\frac{1}{256} \\cdot 4 \\cdot V^3 \\]\n"
+    "\\[ 32 = \\frac{V^3}{64} \\]\n"
+    "\\[ 32 \\cdot 64 = V^3 \\]\n"
+    "\\[ 2048 = V^3 \\]\n"
+    "\\[ V = \\sqrt[3]{2048} \\]\n"
+    "\\[ V = 12.8 \\]\n"
+    "Thus, the wind velocity is \\( \\boxed{12.8} \\) miles per hour."
+)
+
+def _build_qwen_cot_prompt(question: str) -> str:
+    """
+    Builds a qwen25-math-cot prompt: system + 1-shot demo + question
+    in a single user turn, exactly as One-Shot-RLVR eval does.
+    """
+    demo = f"{_QWEN_COT_1SHOT_Q}\n\n{_QWEN_COT_1SHOT_A}"
+    user_content = f"{demo}\n\n{question}"
+    return (
+        f"<|im_start|>system\n{_QWEN_COT_SYSTEM}<|im_end|>\n"
+        f"<|im_start|>user\n{user_content}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default hyperparameters
@@ -218,6 +264,42 @@ def launch_engines(num_engines: int, model_path: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading  (verl parquet schema)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def load_val_task_datas(parquet_path: str) -> list:
+    """
+    Load val parquet using the qwen25-math-cot prompt format (One-Shot-RLVR eval).
+    Does NOT need the tokenizer — prompt is built directly as a raw string.
+    """
+    if not os.path.exists(parquet_path):
+        raise FileNotFoundError(
+            f"Parquet not found: {parquet_path}\n"
+            "Pass the correct path via --val_parquet_path"
+        )
+    df = pd.read_parquet(parquet_path)
+    if len(df) == 0:
+        raise RuntimeError(f"Parquet has zero rows: {parquet_path}")
+
+    task_datas = []
+    for _, row in df.iterrows():
+        chat = list(row["prompt"])
+        reward_model = row["reward_model"]
+        gt = reward_model["ground_truth"] if isinstance(reward_model, dict) else str(reward_model)
+        ds = str(row.get("data_source", "deepscaler"))
+        # extract raw question from first user message
+        question = ""
+        for msg in chat:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                question = msg.get("content", "")
+                break
+        prompt_str = _build_qwen_cot_prompt(question)
+        task_datas.append({
+            "prompt_str":   prompt_str,
+            "ground_truth": str(gt),
+            "data_source":  ds,
+            "question":     question,
+        })
+    return task_datas
+
 
 def load_task_datas(parquet_path: str, tokenizer) -> list:
     """
@@ -469,28 +551,30 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
 
     accuracy = correct / len(batch)
 
-    # Show first val_show_n examples with full prompt + reasoning chain
-    for idx in range(min(val_show_n, len(batch))):
+    # Show all evaluated examples: compact header + full CoT
+    for idx in range(len(batch)):
         data = batch[idx]
         completion = outputs[idx].outputs[0].text
         extracted = os_extract_answer(completion, data_name="math500")
         is_correct = correctness_list[idx] == 1.0
         result_tag = "✓ CORRECT" if is_correct else "✗ WRONG"
-        display_resp = completion if len(completion) <= 2000 else completion[:2000] + "\n  ... [truncated]"
+        # Full CoT for val_show_n examples; compact (500 chars) for the rest
+        if idx < val_show_n:
+            display_resp = completion if len(completion) <= 2000 else completion[:2000] + "\n  ... [truncated]"
+        else:
+            display_resp = completion[:500] + " ... [truncated]" if len(completion) > 500 else completion
 
         print(f"\n{'─' * 70}")
-        print(f"[VAL EXAMPLE {idx + 1}/{min(val_show_n, len(batch))}]  {result_tag}")
-        print("─" * 70)
-        print("[QUESTION]")
-        print(f"  {data.get('question', '(question unavailable)')}")
-        print("─" * 70)
-        print("[REASONING CHAIN]")
-        for line in display_resp.splitlines():
-            print(f"  {line}")
-        print("─" * 70)
-        print(f"  Ground Truth    : {data['ground_truth']}")
-        print(f"  Extracted Answer: {extracted if extracted else '(none)'}")
-        print(f"  Result          : {result_tag}")
+        print(f"[VAL {idx + 1}/{len(batch)}]  {result_tag}")
+        print(f"  Q : {data.get('question', '')[:120]}")
+        print(f"  GT: {data['ground_truth']}   PRED: {extracted if extracted else '(none)'}")
+        if idx < val_show_n:
+            print("─" * 70)
+            print("[REASONING CHAIN]")
+            for line in display_resp.splitlines():
+                print(f"  {line}")
+        else:
+            print(f"  CoT: {display_resp[:200].replace(chr(10), ' ')}")
         print("─" * 70)
 
     print(f"\n[VAL] accuracy = {accuracy:.4f}  ({int(correct)}/{len(batch)})")
@@ -634,7 +718,7 @@ def main(args):
     val_task_datas = None
     if args.val_parquet_path and os.path.exists(args.val_parquet_path):
         print(f"[DATA] Loading val:   {args.val_parquet_path}")
-        val_task_datas = load_task_datas(args.val_parquet_path, tokenizer)
+        val_task_datas = load_val_task_datas(args.val_parquet_path)
         print(f"[DATA] {len(val_task_datas)} val examples loaded.")
     else:
         print(f"[DATA] Val path not found ({args.val_parquet_path}), "
