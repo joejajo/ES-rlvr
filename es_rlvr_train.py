@@ -505,13 +505,25 @@ def _postprocess_outputs(outputs, task_datas: list,
                 print(f"  Total Reward    : {total:.4f}")
             print("=" * 70 + "\n")
 
+    # first sample captured for train_outputs.csv
+    first = {}
+    if outputs and task_datas:
+        first_completion = outputs[0].outputs[0].text
+        first["question"]         = task_datas[0].get("question", "")
+        first["model_response"]   = first_completion
+        first["extracted_answer"] = os_extract_answer(first_completion, "math500")
+        first["ground_truth"]     = task_datas[0].get("ground_truth", "")
+        first["binary_reward"]    = correctness_scores[0] if correctness_scores else 0.0
+        first["entropy"]          = entropy_vals[0]        if entropy_vals       else 0.0
+
     return {
         "scores":             total_scores,
         "correctness_scores": correctness_scores,
-        "avg_reward":         float(np.mean(total_scores))       if total_scores    else 0.0,
+        "avg_reward":         float(np.mean(total_scores))       if total_scores       else 0.0,
         "avg_correctness":    float(np.mean(correctness_scores)) if correctness_scores else 0.0,
-        "avg_entropy":        float(np.mean(entropy_vals))       if entropy_vals    else 0.0,
-        "avg_coverage":       float(np.mean(coverage_vals))      if coverage_vals   else 0.0,
+        "avg_entropy":        float(np.mean(entropy_vals))       if entropy_vals       else 0.0,
+        "avg_coverage":       float(np.mean(coverage_vals))      if coverage_vals      else 0.0,
+        "first_sample":       first,
     }
 
 
@@ -520,7 +532,8 @@ def _postprocess_outputs(outputs, task_datas: list,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
-                     iteration: int, writer, val_show_n: int = 3) -> float:
+                     iteration: int, writer, val_show_n: int = 3,
+                     val_outputs_path: str = None) -> float:
     """
     On-the-go greedy evaluation on math500 (or any val set).
 
@@ -579,6 +592,29 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
 
     print(f"\n[VAL] accuracy = {accuracy:.4f}  ({int(correct)}/{len(batch)})")
     print(f"{'#' * 70}\n")
+
+    # ── Write val outputs CSV ─────────────────────────────────────────────────
+    if val_outputs_path:
+        import csv as _csv
+        file_exists = os.path.exists(val_outputs_path)
+        with open(val_outputs_path, "a", newline="", encoding="utf-8") as f:
+            fieldnames = ["iter", "example_idx", "question", "model_response",
+                          "extracted_answer", "ground_truth", "correct"]
+            w = _csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                w.writeheader()
+            for idx, (data, completion, score) in enumerate(
+                zip(batch, [o.outputs[0].text for o in outputs], correctness_list)
+            ):
+                w.writerow({
+                    "iter":             iteration,
+                    "example_idx":      idx,
+                    "question":         data.get("question", ""),
+                    "model_response":   completion,
+                    "extracted_answer": os_extract_answer(completion, "math500"),
+                    "ground_truth":     data["ground_truth"],
+                    "correct":          int(score),
+                })
 
     if writer is not None:
         writer.add_scalar("val/accuracy", accuracy, iteration)
@@ -791,8 +827,11 @@ def main(args):
         "val_iter":           [],
         "val_accuracy":       [],
     }
-    csv_path = os.path.join(logging_dir, "metrics.csv")
-    csv_header_written = False
+    csv_path          = os.path.join(logging_dir, "metrics.csv")
+    train_outputs_csv = os.path.join(logging_dir, "train_outputs.csv")
+    val_outputs_csv   = os.path.join(logging_dir, "val_outputs.csv")
+    csv_header_written      = False
+    train_csv_header_written = False
 
     # ── Pre-training baseline validation ─────────────────────────────────────
     if val_task_datas:
@@ -800,6 +839,7 @@ def main(args):
         baseline_acc = evaluate_val_set(
             engines[0], val_task_datas, args.val_batch_size,
             -1, writer, val_show_n=args.val_show_n,
+            val_outputs_path=val_outputs_csv,
         )
         history["val_iter"].append(-1)
         history["val_accuracy"].append(baseline_acc)
@@ -992,6 +1032,26 @@ def main(args):
                 csv_header_written = True
             w.writerow(csv_row)
 
+        # ── Write one train output sample to train_outputs.csv ────────────────
+        # Pick first_sample from the first seed evaluated this iteration
+        _train_first = {}
+        for _v in seeds_perf.values():
+            _fs = _v.get("first_sample", {})
+            if _fs:
+                _train_first = _fs
+                break
+        import csv as _csv
+        _train_csv_mode = "w" if not train_csv_header_written else "a"
+        with open(train_outputs_csv, _train_csv_mode, newline="", encoding="utf-8") as _f:
+            _train_fields = ["iter", "question", "model_response", "extracted_answer",
+                             "ground_truth", "binary_reward", "entropy"]
+            _tw = _csv.DictWriter(_f, fieldnames=_train_fields)
+            if not train_csv_header_written:
+                _tw.writeheader()
+                train_csv_header_written = True
+            if _train_first:
+                _tw.writerow({"iter": i, **_train_first})
+
         # ── ES weight update on engine 0 ──────────────────────────────────────
         # Antithetic: Δθ += (α/N) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
         # Standard:   Δθ += (α/N) × Aᵢ × εᵢ
@@ -1049,6 +1109,7 @@ def main(args):
             val_acc = evaluate_val_set(
                 engines[0], val_task_datas, args.val_batch_size,
                 i, writer, val_show_n=args.val_show_n,
+                val_outputs_path=val_outputs_csv,
             )
             history["val_iter"].append(i)
             history["val_accuracy"].append(val_acc)
@@ -1086,6 +1147,7 @@ def main(args):
             engines[0], val_task_datas, len(val_task_datas),
             iteration=args.num_iterations, writer=writer,
             val_show_n=args.val_show_n,
+            val_outputs_path=val_outputs_csv,
         )
         print(f"\n[FINAL] Math500 accuracy = {final_acc:.4f}  ({int(final_acc * len(val_task_datas))}/{len(val_task_datas)})")
         writer.add_scalar("val/final_accuracy", final_acc, args.num_iterations)
