@@ -170,8 +170,8 @@ def parse_args():
     parser.add_argument("--val_parquet_path", type=str,
                         default="Dataset parquet/math500.parquet",
                         help="Validation parquet (verl schema). math500.")
-    parser.add_argument("--val_batch_size", type=int, default=500,
-                        help="Number of val examples to evaluate each val step.")
+    parser.add_argument("--val_batch_size", type=int, default=50,
+                        help="Number of val examples to evaluate each val step (full 500 run post-training).")
     # ES
     parser.add_argument("--sigma", type=float, default=SIGMA)
     parser.add_argument("--alpha", type=float, default=ALPHA)
@@ -1076,6 +1076,19 @@ def main(args):
         )
     )
     print(f"\n[SAVE] Final weights saved to {final_path}/pytorch_model.pth")
+
+    # ── Full math500 evaluation after training ────────────────────────────────
+    if val_task_datas:
+        print("\n" + "=" * 70)
+        print("  POST-TRAINING: Full Math500 Evaluation (500 examples, greedy)")
+        print("=" * 70)
+        final_acc = evaluate_val_set(
+            engines[0], val_task_datas, len(val_task_datas),
+            iteration=args.num_iterations, writer=writer,
+            val_show_n=args.val_show_n,
+        )
+        print(f"\n[FINAL] Math500 accuracy = {final_acc:.4f}  ({int(final_acc * len(val_task_datas))}/{len(val_task_datas)})")
+        writer.add_scalar("val/final_accuracy", final_acc, args.num_iterations)
 
     save_plots(history, logging_dir)
     print(f"[CSV]  Metrics log → {csv_path}")
