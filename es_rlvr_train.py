@@ -170,7 +170,7 @@ def parse_args():
     parser.add_argument("--val_parquet_path", type=str,
                         default="Dataset parquet/math500.parquet",
                         help="Validation parquet (verl schema). math500.")
-    parser.add_argument("--val_batch_size", type=int, default=50,
+    parser.add_argument("--val_batch_size", type=int, default=500,
                         help="Number of val examples to evaluate each val step.")
     # ES
     parser.add_argument("--sigma", type=float, default=SIGMA)
@@ -531,7 +531,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     Shows the question, full reasoning chain, extracted answer and
     correct/wrong label for the first val_show_n examples.
     """
-    batch = val_task_datas[:val_batch_size]
+    batch = val_task_datas[:val_batch_size] if val_batch_size > 0 else val_task_datas
     prompts = [d["prompt_str"] for d in batch]
     sampling_params = SamplingParams(temperature=0.0, max_tokens=3072)
 
