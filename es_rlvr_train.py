@@ -88,6 +88,8 @@ except ImportError:
             return s.getsockname()[1]
 
 from deepscaler import compute_score, SYSTEM_PROMPT
+from utils.os_parser import extract_answer as os_extract_answer, strip_string
+from utils.os_grader import math_equal
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -459,12 +461,9 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     correct = 0.0
     correctness_list = []
     for output, data in zip(outputs, batch):
-        c = float(compute_score(
-            data_source=data.get("data_source", "deepscaler"),
-            solution_str=output.outputs[0].text,
-            ground_truth=data["ground_truth"],
-            use_think=False,
-        ))
+        pred = os_extract_answer(output.outputs[0].text, data_name="math500")
+        gt   = strip_string(str(data["ground_truth"]))
+        c    = 1.0 if (pred != "" and math_equal(pred, gt, timeout=False)) else 0.0
         correct += c
         correctness_list.append(c)
 
@@ -474,7 +473,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     for idx in range(min(val_show_n, len(batch))):
         data = batch[idx]
         completion = outputs[idx].outputs[0].text
-        boxed = _extract_boxed(completion)
+        extracted = os_extract_answer(completion, data_name="math500")
         is_correct = correctness_list[idx] == 1.0
         result_tag = "✓ CORRECT" if is_correct else "✗ WRONG"
         display_resp = completion if len(completion) <= 2000 else completion[:2000] + "\n  ... [truncated]"
@@ -490,7 +489,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
             print(f"  {line}")
         print("─" * 70)
         print(f"  Ground Truth    : {data['ground_truth']}")
-        print(f"  Extracted Answer: {boxed if boxed else '(none — no \\boxed{})'}")
+        print(f"  Extracted Answer: {extracted if extracted else '(none)'}")
         print(f"  Result          : {result_tag}")
         print("─" * 70)
 
