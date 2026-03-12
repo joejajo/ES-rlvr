@@ -87,7 +87,7 @@ except ImportError:
             s.bind(("", 0))
             return s.getsockname()[1]
 
-from deepscaler import compute_score, SYSTEM_PROMPT
+from deepscaler import compute_training_score, SYSTEM_PROMPT
 from utils.os_parser import extract_answer as os_extract_answer, strip_string
 from utils.os_grader import math_equal
 
@@ -467,13 +467,7 @@ def _postprocess_outputs(outputs, task_datas: list,
 
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
         completion = output.outputs[0].text
-        binary_reward = float(compute_score(
-            data_source=data.get("data_source", "deepscaler"),
-            solution_str=completion,
-            ground_truth=data["ground_truth"],
-            extra_info=None,
-            use_think=False,
-        ))
+        binary_reward = compute_training_score(completion, data["ground_truth"])
         ent, cov = _compute_token_entropy(output)
         total = binary_reward + entropy_coeff * ent
 

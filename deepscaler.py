@@ -51,6 +51,25 @@ def _is_numeric_match(a, b, tol=1e-6):
         return False
 
 
+def compute_training_score(solution_str: str, ground_truth: str) -> float:
+    """
+    Training-only reward for pi1_r128 (single question, GT = "12.8").
+
+    Rules:
+      1. Model output must contain \\boxed{<answer>}.
+      2. Extracted answer must equal ground_truth numerically (float, tol=1e-6).
+         e.g. "12.8", "12.80", "12.800000" all pass.
+         "12.9", "10", "\\frac{64}{5}" all fail.
+      3. No symbolic math, no string fuzzing — exact numeric match only.
+
+    Returns 1.0 (correct) or 0.0 (wrong).
+    """
+    model_answer = extract_answer(solution_str)
+    if model_answer is None:
+        return 0.0
+    return 1.0 if _is_numeric_match(model_answer, str(ground_truth)) else 0.0
+
+
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, use_think=False):
     """
     One-shot RLVR style binary reward:
