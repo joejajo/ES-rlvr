@@ -540,7 +540,11 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     """
     batch = val_task_datas[:val_batch_size] if val_batch_size > 0 else val_task_datas
     prompts = [d["prompt_str"] for d in batch]
-    sampling_params = SamplingParams(temperature=0.0, max_tokens=3072)
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=3072,
+        stop=["<|im_end|>", "<|im_start|>"],  # stop at end of assistant turn
+    )
 
     print(f"\n{'#' * 70}")
     print(f"  [VAL] Iter {iteration} — Math500 greedy eval on {len(batch)} examples")
