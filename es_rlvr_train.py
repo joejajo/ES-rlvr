@@ -45,6 +45,7 @@ then NCCL-broadcast to all engines.
 import argparse
 from datetime import datetime
 import gc
+import json
 import os
 import re
 import random
@@ -196,6 +197,11 @@ def parse_args():
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
+
+    if args.output_every <= 0:
+        raise ValueError("--output_every must be >= 1")
+    if args.antithetic and args.population_size % 2 != 0:
+        raise ValueError("--population_size must be even when --antithetic is enabled")
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
 
@@ -371,6 +377,11 @@ def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
     return handle, time.time()
 
 
+def _append_jsonl(path: str, row: dict):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Reward computation  (One-Shot-RLVR faithful)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -379,6 +390,35 @@ def _extract_boxed(text: str):
     """Extract last \\boxed{} content — used for display only."""
     matches = re.findall(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}", text or "")
     return matches[-1].strip() if matches else None
+
+
+def _truncate_after_first_boxed(text: str) -> str:
+    """Trim response right after the first complete \boxed{...} block."""
+    s = text or ""
+    start = s.find(r"\boxed")
+    if start == -1:
+        return s
+
+    i = start + len(r"\boxed")
+    while i < len(s) and s[i].isspace():
+        i += 1
+    if i >= len(s) or s[i] != "{":
+        return s
+
+    depth = 0
+    end = None
+    for j in range(i, len(s)):
+        if s[j] == "{":
+            depth += 1
+        elif s[j] == "}":
+            depth -= 1
+            if depth == 0:
+                end = j
+                break
+
+    if end is None:
+        return s
+    return s[:end + 1]
 
 
 def _compute_token_entropy(output_obj) -> tuple:
@@ -456,7 +496,7 @@ def _postprocess_outputs(outputs, task_datas: list,
       avg_reward         — mean total reward across batch
       avg_correctness    — mean binary correctness across batch
       avg_entropy        — mean per-token Shannon entropy (top-k + tail bucket)
-      avg_coverage       — mean top-100 probability mass coverage (diagnostic)
+      avg_coverage       — mean top-20 probability mass coverage (diagnostic)
     """
     correctness_scores = []
     total_scores = []
@@ -465,7 +505,8 @@ def _postprocess_outputs(outputs, task_datas: list,
 
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
         completion = output.outputs[0].text
-        binary_reward = compute_training_score(completion, data["ground_truth"])
+        completion_for_reward = _truncate_after_first_boxed(completion)
+        binary_reward = compute_training_score(completion_for_reward, data["ground_truth"])
         ent, cov = _compute_token_entropy(output)
         total = binary_reward + entropy_coeff * ent
 
@@ -489,18 +530,20 @@ def _postprocess_outputs(outputs, task_datas: list,
                 print(f"  {line}")
             print("─" * 70)
             print(f"  Ground Truth    : {data['ground_truth']}")
-            print(f"  Extracted Answer: {boxed if boxed else '(none — no \\boxed{})'}")
+            extracted = boxed if boxed else "(none — no boxed answer)"
+            print(f"  Extracted Answer: {extracted}")
             print(f"  Result          : {correct_str}  (binary={binary_reward:.1f})")
-            print(f"  Entropy (top-100): {ent:.4f}  coverage={cov:.4f}")
+            print(f"  Entropy (top-20): {ent:.4f}  coverage={cov:.4f}")
             if entropy_coeff > 0.0:
                 print(f"  Entropy Bonus   : {entropy_coeff * ent:.6f}")
                 print(f"  Total Reward    : {total:.4f}")
             print("=" * 70 + "\n")
 
-    # first sample captured for train_outputs.csv
+    # first sample captured for train_outputs.jsonl
     first = {}
     if outputs and task_datas:
         first_completion = outputs[0].outputs[0].text
+        first_completion = _truncate_after_first_boxed(first_completion)
         first["question"]         = task_datas[0].get("question", "")
         first["model_response"]   = first_completion
         first["extracted_answer"] = _extract_boxed(first_completion) or ""
@@ -552,7 +595,8 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     correct = 0.0
     correctness_list = []
     for output, data in zip(outputs, batch):
-        c    = compute_score(data.get("data_source", "math500"), output.outputs[0].text, data["ground_truth"])
+        completion_for_reward = _truncate_after_first_boxed(output.outputs[0].text)
+        c    = compute_score(data.get("data_source", "math500"), completion_for_reward, data["ground_truth"])
         correct += c
         correctness_list.append(c)
 
@@ -561,7 +605,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     # Show all evaluated examples: compact header + full CoT
     for idx in range(len(batch)):
         data = batch[idx]
-        completion = outputs[idx].outputs[0].text
+        completion = _truncate_after_first_boxed(outputs[idx].outputs[0].text)
         extracted = _extract_boxed(completion) or ""
         is_correct = correctness_list[idx] == 1.0
         result_tag = "✓ CORRECT" if is_correct else "✗ WRONG"
@@ -587,28 +631,20 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     print(f"\n[VAL] accuracy = {accuracy:.4f}  ({int(correct)}/{len(batch)})")
     print(f"{'#' * 70}\n")
 
-    # ── Write val outputs CSV ─────────────────────────────────────────────────
+    # ── Write val outputs JSONL ───────────────────────────────────────────────
     if val_outputs_path:
-        import csv as _csv
-        file_exists = os.path.exists(val_outputs_path)
-        with open(val_outputs_path, "a", newline="", encoding="utf-8") as f:
-            fieldnames = ["iter", "example_idx", "question", "model_response",
-                          "extracted_answer", "ground_truth", "correct"]
-            w = _csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists:
-                w.writeheader()
-            for idx, (data, completion, score) in enumerate(
-                zip(batch, [o.outputs[0].text for o in outputs], correctness_list)
-            ):
-                w.writerow({
-                    "iter":             iteration,
-                    "example_idx":      idx,
-                    "question":         data.get("question", ""),
-                    "model_response":   completion,
-                    "extracted_answer": _extract_boxed(completion) or "",
-                    "ground_truth":     data["ground_truth"],
-                    "correct":          int(score),
-                })
+        for idx, (data, completion, score) in enumerate(
+            zip(batch, [_truncate_after_first_boxed(o.outputs[0].text) for o in outputs], correctness_list)
+        ):
+            _append_jsonl(val_outputs_path, {
+                "iter":             iteration,
+                "example_idx":      idx,
+                "question":         data.get("question", ""),
+                "model_response":   completion,
+                "extracted_answer": _extract_boxed(completion) or "",
+                "ground_truth":     data["ground_truth"],
+                "correct":          int(score),
+            })
 
     if writer is not None:
         writer.add_scalar("val/accuracy", accuracy, iteration)
@@ -687,10 +723,10 @@ def save_plots(history: dict, output_dir: str):
     # ── Bottom-right: entropy proxy ───────────────────────────────────────────
     ax = axes[1, 1]
     ax.plot(iters, history["entropy"],
-            color="tab:purple", linewidth=1.5, label="H (top-100 + tail)")
+            color="tab:purple", linewidth=1.5, label="H (top-20 + tail)")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Shannon entropy  H (nats/token)")
-    ax.set_title("Response Token Entropy (top-100 approx)")
+    ax.set_title("Response Token Entropy (top-20 approx)")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -810,7 +846,7 @@ def main(args):
     print(f"  Log dir        : {logging_dir}")
     print("=" * 70 + "\n")
 
-    # ── Metrics history (for plots + CSV) ────────────────────────────────────
+    # ── Metrics history (for plots + JSONL) ──────────────────────────────────
     history = {
         "iter":               [],
         "train_correctness":  [],
@@ -821,11 +857,9 @@ def main(args):
         "val_iter":           [],
         "val_accuracy":       [],
     }
-    csv_path          = os.path.join(logging_dir, "metrics.csv")
-    train_outputs_csv = os.path.join(logging_dir, "train_outputs.csv")
-    val_outputs_csv   = os.path.join(logging_dir, "val_outputs.csv")
-    csv_header_written      = False
-    train_csv_header_written = False
+    metrics_jsonl_path = os.path.join(logging_dir, "metrics.jsonl")
+    train_outputs_jsonl = os.path.join(logging_dir, "train_outputs.jsonl")
+    val_outputs_jsonl   = os.path.join(logging_dir, "val_outputs.jsonl")
 
     # ── Pre-training baseline validation ─────────────────────────────────────
     if val_task_datas:
@@ -833,23 +867,16 @@ def main(args):
         baseline_acc = evaluate_val_set(
             engines[0], val_task_datas, args.val_batch_size,
             -1, writer, val_show_n=args.val_show_n,
-            val_outputs_path=val_outputs_csv,
+            val_outputs_path=val_outputs_jsonl,
         )
         history["val_iter"].append(-1)
         history["val_accuracy"].append(baseline_acc)
-        with open(csv_path, "w", newline="") as f:
-            import csv as _csv
-            w = _csv.DictWriter(f, fieldnames=[
-                "iter", "train_correctness", "reward_mean",
-                "reward_std", "entropy", "entropy_coverage", "val_accuracy",
-            ])
-            w.writeheader()
-            w.writerow({
-                "iter": "baseline", "train_correctness": "",
-                "reward_mean": "", "reward_std": "",
-                "entropy": "", "entropy_coverage": "", "val_accuracy": baseline_acc,
-            })
-        csv_header_written = True
+        _append_jsonl(metrics_jsonl_path, {
+            "iter": "baseline", "train_correctness": None,
+            "reward_mean": None, "reward_std": None,
+            "entropy": None, "entropy_coverage": None, "val_accuracy": baseline_acc,
+            "event": "baseline_val",
+        })
 
     # ──────────────────────────────────────────────────────────────────────────
     # Training loop
@@ -1008,25 +1035,19 @@ def main(args):
         history["entropy"].append(mean_e)
         history["entropy_coverage"].append(mean_cov)
 
-        csv_row = {
+        metrics_row = {
             "iter":              i,
             "train_correctness": mean_c,
             "reward_mean":       mean_r,
             "reward_std":        std_r,
             "entropy":           mean_e,
             "entropy_coverage":  mean_cov,
-            "val_accuracy":      "",   # filled in at val steps
+            "val_accuracy":      None,
+            "event":             "train_iter",
         }
-        write_mode = "w" if not csv_header_written else "a"
-        with open(csv_path, write_mode, newline="") as f:
-            import csv as _csv
-            w = _csv.DictWriter(f, fieldnames=list(csv_row.keys()))
-            if not csv_header_written:
-                w.writeheader()
-                csv_header_written = True
-            w.writerow(csv_row)
+        _append_jsonl(metrics_jsonl_path, metrics_row)
 
-        # ── Write one train output sample to train_outputs.csv ────────────────
+        # ── Write one train output sample to train_outputs.jsonl ──────────────
         # Pick first_sample from the first seed evaluated this iteration
         _train_first = {}
         for _v in seeds_perf.values():
@@ -1034,17 +1055,8 @@ def main(args):
             if _fs:
                 _train_first = _fs
                 break
-        import csv as _csv
-        _train_csv_mode = "w" if not train_csv_header_written else "a"
-        with open(train_outputs_csv, _train_csv_mode, newline="", encoding="utf-8") as _f:
-            _train_fields = ["iter", "question", "model_response", "extracted_answer",
-                             "ground_truth", "binary_reward", "entropy"]
-            _tw = _csv.DictWriter(_f, fieldnames=_train_fields)
-            if not train_csv_header_written:
-                _tw.writeheader()
-                train_csv_header_written = True
-            if _train_first:
-                _tw.writerow({"iter": i, **_train_first})
+        if _train_first:
+            _append_jsonl(train_outputs_jsonl, {"iter": i, **_train_first})
 
         # ── ES weight update on engine 0 ──────────────────────────────────────
         # Antithetic: Δθ += (α/N) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
@@ -1103,22 +1115,16 @@ def main(args):
             val_acc = evaluate_val_set(
                 engines[0], val_task_datas, args.val_batch_size,
                 i, writer, val_show_n=args.val_show_n,
-                val_outputs_path=val_outputs_csv,
+                val_outputs_path=val_outputs_jsonl,
             )
             history["val_iter"].append(i)
             history["val_accuracy"].append(val_acc)
-            # Update CSV val_accuracy column for this iter (append a marker row)
-            with open(csv_path, "a", newline="") as f:
-                import csv as _csv
-                w = _csv.DictWriter(f, fieldnames=[
-                    "iter", "train_correctness", "reward_mean",
-                    "reward_std", "entropy", "entropy_coverage", "val_accuracy",
-                ])
-                w.writerow({
-                    "iter": f"val@{i}", "train_correctness": "",
-                    "reward_mean": "", "reward_std": "",
-                    "entropy": "", "entropy_coverage": "", "val_accuracy": val_acc,
-                })
+            _append_jsonl(metrics_jsonl_path, {
+                "iter": f"val@{i}", "train_correctness": None,
+                "reward_mean": None, "reward_std": None,
+                "entropy": None, "entropy_coverage": None, "val_accuracy": val_acc,
+                "event": "val_iter",
+            })
             save_plots(history, logging_dir)
 
     # ── Save final model weights ──────────────────────────────────────────────
@@ -1141,13 +1147,13 @@ def main(args):
             engines[0], val_task_datas, len(val_task_datas),
             iteration=args.num_iterations, writer=writer,
             val_show_n=args.val_show_n,
-            val_outputs_path=val_outputs_csv,
+            val_outputs_path=val_outputs_jsonl,
         )
         print(f"\n[FINAL] Math500 accuracy = {final_acc:.4f}  ({int(final_acc * len(val_task_datas))}/{len(val_task_datas)})")
         writer.add_scalar("val/final_accuracy", final_acc, args.num_iterations)
 
     save_plots(history, logging_dir)
-    print(f"[CSV]  Metrics log → {csv_path}")
+    print(f"[JSONL] Metrics log → {metrics_jsonl_path}")
 
     cleanup()
     writer.close()
