@@ -87,9 +87,7 @@ except ImportError:
             s.bind(("", 0))
             return s.getsockname()[1]
 
-from deepscaler import compute_training_score, SYSTEM_PROMPT
-from utils.os_parser import extract_answer as os_extract_answer
-from utils.math500_eval import grade_answer as grade_math500
+from deepscaler import compute_training_score, compute_score, SYSTEM_PROMPT
 
 # ── qwen25-math-cot val prompt (matches One-Shot-RLVR eval exactly) ───────────
 # Template: system + all demos + actual question in one user turn.
@@ -505,7 +503,7 @@ def _postprocess_outputs(outputs, task_datas: list,
         first_completion = outputs[0].outputs[0].text
         first["question"]         = task_datas[0].get("question", "")
         first["model_response"]   = first_completion
-        first["extracted_answer"] = os_extract_answer(first_completion, "math500")
+        first["extracted_answer"] = _extract_boxed(first_completion) or ""
         first["ground_truth"]     = task_datas[0].get("ground_truth", "")
         first["binary_reward"]    = correctness_scores[0] if correctness_scores else 0.0
         first["entropy"]          = entropy_vals[0]        if entropy_vals       else 0.0
@@ -554,7 +552,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     correct = 0.0
     correctness_list = []
     for output, data in zip(outputs, batch):
-        c    = grade_math500(output.outputs[0].text, data["ground_truth"])
+        c    = compute_score(data.get("data_source", "math500"), output.outputs[0].text, data["ground_truth"])
         correct += c
         correctness_list.append(c)
 
@@ -564,7 +562,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     for idx in range(len(batch)):
         data = batch[idx]
         completion = outputs[idx].outputs[0].text
-        extracted = os_extract_answer(completion, data_name="math500")
+        extracted = _extract_boxed(completion) or ""
         is_correct = correctness_list[idx] == 1.0
         result_tag = "✓ CORRECT" if is_correct else "✗ WRONG"
         # Full CoT for val_show_n examples; compact (500 chars) for the rest
@@ -607,7 +605,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
                     "example_idx":      idx,
                     "question":         data.get("question", ""),
                     "model_response":   completion,
-                    "extracted_answer": os_extract_answer(completion, data_name="math500"),
+                    "extracted_answer": _extract_boxed(completion) or "",
                     "ground_truth":     data["ground_truth"],
                     "correct":          int(score),
                 })
