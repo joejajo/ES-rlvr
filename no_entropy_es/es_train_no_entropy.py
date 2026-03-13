@@ -170,6 +170,11 @@ def parse_args():
 
     args = parser.parse_args()
 
+    if args.output_every <= 0:
+        raise ValueError("--output_every must be >= 1")
+    if args.antithetic and args.population_size % 2 != 0:
+        raise ValueError("--population_size must be even when --antithetic is enabled")
+
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
 
     if args.global_seed is not None:
@@ -318,6 +323,35 @@ def _extract_boxed(text: str):
     return matches[-1].strip() if matches else None
 
 
+def _truncate_after_first_boxed(text: str) -> str:
+    """Trim response right after the first complete \boxed{...} block."""
+    s = text or ""
+    start = s.find(r"\boxed")
+    if start == -1:
+        return s
+
+    i = start + len(r"\boxed")
+    while i < len(s) and s[i].isspace():
+        i += 1
+    if i >= len(s) or s[i] != "{":
+        return s
+
+    depth = 0
+    end = None
+    for j in range(i, len(s)):
+        if s[j] == "{":
+            depth += 1
+        elif s[j] == "}":
+            depth -= 1
+            if depth == 0:
+                end = j
+                break
+
+    if end is None:
+        return s
+    return s[:end + 1]
+
+
 def _compute_token_entropy(output_obj) -> tuple:
     """
     Average per-token Shannon entropy from vLLM top-20 logprobs.
@@ -399,7 +433,8 @@ def _postprocess_outputs(outputs, task_datas: list,
 
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
         completion = output.outputs[0].text
-        binary_reward = compute_training_score(completion, data["ground_truth"])
+        completion_for_reward = _truncate_after_first_boxed(completion)
+        binary_reward = compute_training_score(completion_for_reward, data["ground_truth"])
         ent, cov = _compute_token_entropy(output)
 
         correctness_scores.append(binary_reward)
@@ -421,7 +456,8 @@ def _postprocess_outputs(outputs, task_datas: list,
                 print(f"  {line}")
             print("─" * 70)
             print(f"  Ground Truth    : {data['ground_truth']}")
-            print(f"  Extracted Answer: {boxed if boxed else '(none — no \\boxed{})'}")
+            extracted = boxed if boxed else "(none — no boxed answer)"
+            print(f"  Extracted Answer: {extracted}")
             print(f"  Result          : {correct_str}  (binary={binary_reward:.1f})")
             print(f"  Entropy (monitor): {ent:.4f}  coverage={cov:.4f}  [NOT used in reward]")
             print("=" * 70 + "\n")
@@ -429,6 +465,7 @@ def _postprocess_outputs(outputs, task_datas: list,
     first = {}
     if outputs and task_datas:
         first_completion = outputs[0].outputs[0].text
+        first_completion = _truncate_after_first_boxed(first_completion)
         first["question"]         = task_datas[0].get("question", "")
         first["model_response"]   = first_completion
         first["extracted_answer"] = os_extract_answer(first_completion, "math500")
@@ -471,7 +508,8 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
     correct = 0.0
     correctness_list = []
     for output, data in zip(outputs, batch):
-        c = grade_math500(output.outputs[0].text, data["ground_truth"])
+        completion_for_reward = _truncate_after_first_boxed(output.outputs[0].text)
+        c = grade_math500(completion_for_reward, data["ground_truth"])
         correct += c
         correctness_list.append(c)
 
@@ -479,7 +517,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
 
     for idx in range(len(batch)):
         data = batch[idx]
-        completion = outputs[idx].outputs[0].text
+        completion = _truncate_after_first_boxed(outputs[idx].outputs[0].text)
         extracted = os_extract_answer(completion, data_name="math500")
         is_correct = correctness_list[idx] == 1.0
         result_tag = "✓ CORRECT" if is_correct else "✗ WRONG"
@@ -514,7 +552,7 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
             if not file_exists:
                 w.writeheader()
             for idx, (data, completion, score) in enumerate(
-                zip(batch, [o.outputs[0].text for o in outputs], correctness_list)
+                zip(batch, [_truncate_after_first_boxed(o.outputs[0].text) for o in outputs], correctness_list)
             ):
                 w.writerow({
                     "iter":             iteration,
