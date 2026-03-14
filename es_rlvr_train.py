@@ -14,30 +14,20 @@ One-Shot-RLVR design principles preserved
   This is mathematically identical to the ES z-score normalisation —
   both formulas are the same; GRPO normalises across group rollouts,
   ES normalises across population perturbations.
-- Entropy bonus as a separate term (coeff=0.001):
-    bonus = entropy_coeff × H_approx
-  The paper (verl) computes exact Shannon entropy from full-vocabulary
-  logits: H = logsumexp(X) − Σ_v p_v X_v.  vLLM exposes only top-k
-  log-softmax values, not raw logits; a direct forward pass requires
-  vLLM-internal attention metadata (FlashInferMetadata) that is
-  version-tied and fragile to build externally.
-  We use a tight lower-bound approximation with top-20 logprobs (vLLM max):
-    H_approx = −Σ_{i=1}^{20} p_i log p_i  −  p_tail log p_tail
-  where p_tail = 1 − Σ p_i.  The tail bucket makes this a lower bound
-  on true Shannon entropy rather than ignoring missing mass entirely.
-  The gradient direction is exact.
+- Entropy tracked as a diagnostic metric (top-20 logprobs approximation,
+  lower-bound on Shannon entropy) but NOT added to the reward signal.
+  Binary correctness is the sole reward: total = binary_reward.
 - KL penalty: omitted.  Computing low_var_kl requires a reference model
   forward pass.  In a pure vLLM inference architecture there is no
   autograd model resident in memory, so this term is not feasible
   without a separate HuggingFace inference pass per perturbation.
-- Antithetic pairs (±ε) for variance reduction.
 - On-the-go validation on math500 every val_every iterations.
-- Model output display during training (every 10 iters by default).
+- Model output display during training (every iter by default).
 
-ES weight update (antithetic)
-------------------------------
-For each seed sᵢ with normalised rewards A⁺ᵢ, A⁻ᵢ:
-  Δθ += (α/N) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
+ES weight update (standard, matches VsonicV countdown_accl)
+------------------------------------------------------------
+For each seed sᵢ with normalised reward Aᵢ:
+  Δθ += (α/N) × Aᵢ × εᵢ
 Applied via WorkerExtension.perturb_self_weights(seed, coeff) on engine 0,
 then NCCL-broadcast to all engines.
 """
@@ -145,7 +135,6 @@ ALPHA            = 0.0005         # ES learning rate α
 POPULATION_SIZE  = 20             # number of perturbations per iteration
 NUM_ENGINES      = 4              # parallel vLLM engines (= GPUs)
 NUM_ITERATIONS   = 200
-ENTROPY_COEFF    = 0.001          # matches OneShot-RLVR actor.entropy_coeff
 VAL_EVERY        = 10             # evaluate on math500 every N iterations
 EXPERIMENT_DIR   = "outputs/es_rlvr_oneshot"
 
@@ -174,14 +163,8 @@ def parse_args():
     parser.add_argument("--sigma", type=float, default=SIGMA)
     parser.add_argument("--alpha", type=float, default=ALPHA)
     parser.add_argument("--population_size", type=int, default=POPULATION_SIZE)
-    parser.add_argument("--antithetic", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="Use antithetic (±ε) pairs (default: False).")
     parser.add_argument("--iid_noise", action="store_true", default=False,
                         help="Independent noise per parameter (vs shared noise).")
-    # Reward
-    parser.add_argument("--entropy_coeff", type=float, default=ENTROPY_COEFF,
-                        help="Entropy bonus coefficient (One-Shot-RLVR: 0.001).")
     # Training
     parser.add_argument("--num_engines", type=int, default=NUM_ENGINES)
     parser.add_argument("--num_iterations", type=int, default=NUM_ITERATIONS)
@@ -199,8 +182,6 @@ def parse_args():
 
     if args.output_every <= 0:
         raise ValueError("--output_every must be >= 1")
-    if args.antithetic and args.population_size % 2 != 0:
-        raise ValueError("--population_size must be even when --antithetic is enabled")
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
 
@@ -472,24 +453,23 @@ def _compute_token_entropy(output_obj) -> tuple:
 
 
 def _postprocess_outputs(outputs, task_datas: list,
-                         entropy_coeff: float = 0.0,
                          debug_print: bool = False) -> dict:
     """
-    Compute per-sample total rewards.
+    Compute per-sample rewards.
 
-    One-Shot-RLVR reward design:
-      binary_reward = compute_score(...)              → 1.0 or 0.0
-      entropy_bonus = entropy_coeff × entropy_proxy   → exploratory signal
-      total         = binary_reward + entropy_bonus
+    Reward: binary correctness only.
+      binary_reward = compute_score(...)  → 1.0 or 0.0
+      total         = binary_reward
 
-    KL penalty is omitted (see module docstring).
+    Entropy is computed and returned as a diagnostic metric but does NOT
+    contribute to the reward signal used for ES normalisation.
 
     Returns:
-      scores             — list of total rewards (used for GRPO/ES normalisation)
+      scores             — list of binary rewards (used for GRPO/ES normalisation)
       correctness_scores — list of binary rewards (for logging)
-      avg_reward         — mean total reward across batch
+      avg_reward         — mean binary reward across batch
       avg_correctness    — mean binary correctness across batch
-      avg_entropy        — mean per-token Shannon entropy (top-k + tail bucket)
+      avg_entropy        — mean per-token Shannon entropy (diagnostic only)
       avg_coverage       — mean top-20 probability mass coverage (diagnostic)
     """
     correctness_scores = []
@@ -502,7 +482,7 @@ def _postprocess_outputs(outputs, task_datas: list,
         completion_for_reward = _truncate_after_first_boxed(completion)
         binary_reward = compute_training_score(completion_for_reward, data["ground_truth"])
         ent, cov = _compute_token_entropy(output)
-        total = binary_reward + entropy_coeff * ent
+        total = binary_reward
 
         correctness_scores.append(binary_reward)
         entropy_vals.append(ent)
@@ -527,10 +507,7 @@ def _postprocess_outputs(outputs, task_datas: list,
             extracted = boxed if boxed else "(none — no boxed answer)"
             print(f"  Extracted Answer: {extracted}")
             print(f"  Result          : {correct_str}  (binary={binary_reward:.1f})")
-            print(f"  Entropy (top-20): {ent:.4f}  coverage={cov:.4f}")
-            if entropy_coeff > 0.0:
-                print(f"  Entropy Bonus   : {entropy_coeff * ent:.6f}")
-                print(f"  Total Reward    : {total:.4f}")
+            print(f"  Entropy (top-20) : {ent:.4f}  coverage={cov:.4f}")
             print("=" * 70 + "\n")
 
     # first sample captured for train_outputs.csv
@@ -717,7 +694,7 @@ def save_plots(history: dict, output_dir: str):
     ax.fill_between(iters, means - stds, means + stds,
                     alpha=0.20, color="tab:green", label="±1 std")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("Total Reward (binary + entropy bonus)")
+    ax.set_ylabel("Total Reward (binary correctness)")
     ax.set_title("ES Population Reward")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
@@ -835,11 +812,9 @@ def main(args):
     print("  ES-RLVR: One-Shot-RLVR + vLLM + Ray + NCCL")
     print("=" * 70)
     print(f"  Model          : {args.model_name}")
-    print(f"  Population     : {args.population_size}"
-          f"  ({'antithetic ±ε pairs' if args.antithetic else 'standard'})")
+    print(f"  Population     : {args.population_size}  (standard ES)")
     print(f"  σ (sigma)      : {args.sigma}")
     print(f"  α (alpha)      : {args.alpha}")
-    print(f"  Entropy coeff  : {args.entropy_coeff}")
     print(f"  Engines (GPUs) : {args.num_engines}")
     print(f"  Iterations     : {args.num_iterations}")
     print(f"  Train examples : {len(train_task_datas)}")
@@ -899,43 +874,31 @@ def main(args):
         total_iter_start = time.time()
 
         # ── Build seed list for this generation ───────────────────────────────
-        # Antithetic pairs: N/2 seeds, each yielding (seed, False) and
-        # (seed, True) for +ε and −ε perturbations respectively.
-        if args.antithetic:
-            n_seeds = args.population_size // 2
-            base_seeds = [random.randint(0, 1_000_000) for _ in range(n_seeds)]
-            seed_tasks = []
-            for s in base_seeds:
-                seed_tasks.append((s, False))   # +ε
-                seed_tasks.append((s, True))    # −ε
-        else:
-            base_seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
-            seed_tasks = [(s, False) for s in base_seeds]
+        seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
 
-        seeds_perf: dict = {}            # (seed, negate) → metrics
+        seeds_perf: dict = {}            # seed → metrics
         debug_this_gen = (i % args.output_every == 0)
         debug_fired    = False
 
-        seed_iter = iter(seed_tasks)
+        seed_iter = iter(seeds)
         inflight:  dict = {}             # object_ref → metadata
         results_this_gen = []
 
         # ── Prime all engines ─────────────────────────────────────────────────
         for eng_idx, llm in enumerate(engines):
             try:
-                seed, negate = next(seed_iter)
+                seed = next(seed_iter)
             except StopIteration:
                 break
             ray.get(llm.collective_rpc.remote(
                 "perturb_self_weights",
-                args=(seed, args.sigma, negate, args.iid_noise),
+                args=(seed, args.sigma, False, args.iid_noise),
             ))
             handle, start_ts = evaluate_handle(llm, train_task_datas)
             inflight[handle] = {
                 "engine":     llm,
                 "engine_idx": eng_idx,
                 "seed":       seed,
-                "negate":     negate,
                 "start_ts":   start_ts,
             }
 
@@ -949,18 +912,15 @@ def main(args):
             do_debug    = debug_this_gen and not debug_fired
             metrics     = _postprocess_outputs(
                 outputs, train_task_datas,
-                entropy_coeff=args.entropy_coeff,
                 debug_print=do_debug,
             )
             if do_debug:
                 debug_fired = True
 
             elapsed = time.time() - meta["start_ts"]
-            key = (meta["seed"], meta["negate"])
-            seeds_perf[key] = metrics
+            seeds_perf[meta["seed"]] = metrics
             results_this_gen.append({
                 "seed":            meta["seed"],
-                "negate":          meta["negate"],
                 "avg_reward":      metrics["avg_reward"],
                 "avg_correctness": metrics["avg_correctness"],
                 "avg_entropy":     metrics["avg_entropy"],
@@ -968,34 +928,32 @@ def main(args):
                 "time":            elapsed,
             })
 
-            # Restore engine weights (pass negate so -ε perturbations are correctly undone)
+            # Restore engine weights
             llm = meta["engine"]
             ray.get(llm.collective_rpc.remote(
                 "restore_self_weights",
-                args=(meta["seed"], args.sigma, args.iid_noise, meta["negate"]),
+                args=(meta["seed"], args.sigma, args.iid_noise, False),
             ))
 
             # Schedule next seed on this engine
             try:
-                next_seed, next_negate = next(seed_iter)
+                next_seed = next(seed_iter)
             except StopIteration:
                 continue
 
             ray.get(llm.collective_rpc.remote(
                 "perturb_self_weights",
-                args=(next_seed, args.sigma, next_negate, args.iid_noise),
+                args=(next_seed, args.sigma, False, args.iid_noise),
             ))
             handle, start_ts = evaluate_handle(llm, train_task_datas)
             inflight[handle] = {
                 "engine":     llm,
                 "engine_idx": meta["engine_idx"],
                 "seed":       next_seed,
-                "negate":     next_negate,
                 "start_ts":   start_ts,
             }
             if args.verbose:
-                sign = "(-)" if next_negate else "(+)"
-                print(f"  Scheduled seed {next_seed} {sign} → engine {meta['engine_idx']}")
+                print(f"  Scheduled seed {next_seed} → engine {meta['engine_idx']}")
 
         # ── GRPO / ES reward normalisation ────────────────────────────────────
         # Aᵢ = (rᵢ − mean) / (std + ε)
@@ -1015,11 +973,10 @@ def main(args):
               f"correctness={mean_c:.4f}  entropy={mean_e:.4f}  "
               f"coverage={mean_cov:.4f}")
 
-        for key, v in seeds_perf.items():
+        for s, v in seeds_perf.items():
             v["norm_reward"] = (v["avg_reward"] - mean_r) / (std_r + 1e-8)
             if args.verbose:
-                s, neg = key
-                print(f"    seed={s} {'(-)' if neg else '(+)'}: "
+                print(f"    seed={s}: "
                       f"reward={v['avg_reward']:.4f}  "
                       f"norm={v['norm_reward']:.4f}  "
                       f"correct={v['avg_correctness']:.4f}  "
@@ -1085,31 +1042,18 @@ def main(args):
                 _tw.writerow({"iter": i, **_train_first})
 
         # ── ES weight update on engine 0 ──────────────────────────────────────
-        # Antithetic: Δθ += (α/N) × (A⁺ᵢ − A⁻ᵢ) × εᵢ
-        # Standard:   Δθ += (α/N) × Aᵢ × εᵢ
+        # Standard ES: Δθ += (α/N) × Aᵢ × εᵢ
         perturb_start = time.time()
         handles = []
 
-        if args.antithetic:
-            for s in base_seeds:
-                norm_pos = seeds_perf.get((s, False), {}).get("norm_reward", 0.0)
-                norm_neg = seeds_perf.get((s, True),  {}).get("norm_reward", 0.0)
-                # Combined antithetic coefficient: (A⁺ − A⁻) / N × α
-                coeff = (args.alpha / args.population_size) * (norm_pos - norm_neg)
-                if coeff != 0.0:
-                    handles.append(engines[0].collective_rpc.remote(
-                        "perturb_self_weights",
-                        args=(s, coeff, False, args.iid_noise),
-                    ))
-        else:
-            for s, neg in seed_tasks:
-                norm  = seeds_perf.get((s, neg), {}).get("norm_reward", 0.0)
-                coeff = (args.alpha / args.population_size) * norm
-                if coeff != 0.0:
-                    handles.append(engines[0].collective_rpc.remote(
-                        "perturb_self_weights",
-                        args=(s, coeff, neg, args.iid_noise),
-                    ))
+        for s in seeds:
+            norm  = seeds_perf.get(s, {}).get("norm_reward", 0.0)
+            coeff = (args.alpha / args.population_size) * norm
+            if coeff != 0.0:
+                handles.append(engines[0].collective_rpc.remote(
+                    "perturb_self_weights",
+                    args=(s, coeff, False, args.iid_noise),
+                ))
 
         ray.get(handles)
         t_perturb = time.time() - perturb_start
