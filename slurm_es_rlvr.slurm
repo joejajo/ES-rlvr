@@ -61,8 +61,6 @@ GLOBAL_SEED="${GLOBAL_SEED:-42}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
 VAL_SHOW_N="${VAL_SHOW_N:-3}"       # show N math500 examples in full per eval
 
-pip install --quiet pylatexenc
-
 SCRIPT="${BASE_DIR}/es_rlvr_train.py"
 
 python "${SCRIPT}" \

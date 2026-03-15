@@ -59,8 +59,6 @@ GLOBAL_SEED="${GLOBAL_SEED:-42}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"
 VAL_SHOW_N="${VAL_SHOW_N:-3}"
 
-pip install --quiet pylatexenc
-
 SCRIPT="${BASE_DIR}/no_entropy_es/es_train_no_entropy.py"
 
 python "${SCRIPT}" \
