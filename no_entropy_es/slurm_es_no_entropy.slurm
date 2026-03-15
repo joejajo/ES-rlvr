@@ -69,7 +69,6 @@ python "${SCRIPT}" \
   --global_seed       "${GLOBAL_SEED}" \
   --experiment_dir    "${OUT_DIR}/es_pure_binary" \
   --output_every      "${OUTPUT_EVERY}" \
-  --antithetic \
   --verbose
 
 echo "ES pure binary dir: ${OUT_DIR}/es_pure_binary"

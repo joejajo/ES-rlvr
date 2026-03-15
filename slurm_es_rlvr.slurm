@@ -53,7 +53,6 @@ ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1500}"
-ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"
 GLOBAL_SEED="${GLOBAL_SEED:-42}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
 
@@ -67,12 +66,10 @@ python "${SCRIPT}" \
   --population_size   "${POPULATION_SIZE}" \
   --num_engines       "${NUM_ENGINES}" \
   --num_iterations    "${NUM_ITERATIONS}" \
-  --entropy_coeff     "${ENTROPY_COEFF}" \
   --cuda_devices      0,1,2,3 \
   --global_seed       "${GLOBAL_SEED}" \
   --experiment_dir    "${OUT_DIR}/es_experiment" \
   --output_every      "${OUTPUT_EVERY}" \
-  --antithetic \
   --verbose
 
 echo "ES experiment dir: ${OUT_DIR}/es_experiment"
