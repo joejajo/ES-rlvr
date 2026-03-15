@@ -44,10 +44,6 @@ import signal
 import sys
 import time
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 
 import numpy as np
 import pandas as pd
@@ -275,33 +271,6 @@ def _extract_boxed(text: str):
     return matches[-1].strip() if matches else None
 
 
-def _truncate_after_first_boxed(text: str) -> str:
-    """Trim response right after the first complete \boxed{...} block."""
-    s = text or ""
-    start = s.find(r"\boxed")
-    if start == -1:
-        return s
-
-    i = start + len(r"\boxed")
-    while i < len(s) and s[i].isspace():
-        i += 1
-    if i >= len(s) or s[i] != "{":
-        return s
-
-    depth = 0
-    end = None
-    for j in range(i, len(s)):
-        if s[j] == "{":
-            depth += 1
-        elif s[j] == "}":
-            depth -= 1
-            if depth == 0:
-                end = j
-                break
-
-    if end is None:
-        return s
-    return s[:end + 1]
 
 
 def _compute_token_entropy(output_obj) -> tuple:
@@ -388,8 +357,7 @@ def _postprocess_outputs(outputs, task_datas: list,
 
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
         completion = output.outputs[0].text
-        completion_for_reward = _truncate_after_first_boxed(completion)
-        binary_reward = compute_training_score(completion_for_reward, data["ground_truth"])
+        binary_reward = compute_training_score(completion, data["ground_truth"])
         ent, cov = _compute_token_entropy(output)
 
         correctness_scores.append(binary_reward)
@@ -444,63 +412,6 @@ def _postprocess_outputs(outputs, task_datas: list,
 # ─────────────────────────────────────────────────────────────────────────────
 # Plotting
 # ─────────────────────────────────────────────────────────────────────────────
-
-def save_plots(history: dict, output_dir: str):
-    """
-    Save training curves as a single PNG figure.
-
-    Panels:
-      (left)   Train correctness vs iteration
-      (centre) ES reward mean ± std band vs iteration
-      (right)  Response entropy proxy vs iteration
-    """
-    iters = history["iter"]
-    if not iters:
-        return
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle("ES-RLVR  ·  One-Shot Training", fontsize=13, fontweight="bold")
-
-    # ── Left: train correctness ───────────────────────────────────────────────
-    ax = axes[0]
-    ax.plot(iters, history["train_correctness"],
-            color="tab:blue", linewidth=1.5, label="train correctness")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Mean Correctness")
-    ax.set_title("Training Correctness")
-    ax.set_ylim(-0.05, 1.10)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=9)
-
-    # ── Centre: reward mean ± std ─────────────────────────────────────────────
-    ax = axes[1]
-    means = np.array(history["reward_mean"])
-    stds  = np.array(history["reward_std"])
-    ax.plot(iters, means, color="tab:green", linewidth=1.5, label="mean reward")
-    ax.fill_between(iters, means - stds, means + stds,
-                    alpha=0.20, color="tab:green", label="±1 std")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Reward (binary correctness)")
-    ax.set_title("ES Population Reward")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # ── Right: entropy proxy ──────────────────────────────────────────────────
-    ax = axes[2]
-    ax.plot(iters, history["entropy"],
-            color="tab:purple", linewidth=1.5, label="H (top-20 + tail)")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Shannon entropy  H (nats/token)")
-    ax.set_title("Response Token Entropy")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plot_path = os.path.join(output_dir, "training_curves.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"[PLOT] Saved → {plot_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -599,15 +510,6 @@ def main(args):
     print(f"  Log dir        : {logging_dir}")
     print("=" * 70 + "\n")
 
-    # ── Metrics history (for plots + CSV) ────────────────────────────────────
-    history = {
-        "iter":               [],
-        "train_correctness":  [],
-        "reward_mean":        [],
-        "reward_std":         [],
-        "entropy":            [],
-        "entropy_coverage":   [],
-    }
     train_outputs_jsonl = os.path.join(logging_dir, "train_outputs.jsonl")
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -741,14 +643,6 @@ def main(args):
                 max(r["avg_correctness"] for r in results_this_gen), i,
             )
 
-        # ── Update metrics history + CSV ──────────────────────────────────────
-        history["iter"].append(i)
-        history["train_correctness"].append(mean_c)
-        history["reward_mean"].append(mean_r)
-        history["reward_std"].append(std_r)
-        history["entropy"].append(mean_e)
-        history["entropy_coverage"].append(mean_cov)
-
         # ── Write all train outputs to JSONL (all seeds, all samples) ───────────
         with open(train_outputs_jsonl, "a", encoding="utf-8") as _jf:
             for s, v in seeds_perf.items():
@@ -805,7 +699,7 @@ def main(args):
     )
     print(f"\n[SAVE] Final weights saved to {final_path}/pytorch_model.pth")
 
-    save_plots(history, logging_dir)
+
 
 
     cleanup()
