@@ -28,7 +28,6 @@ set -u
 # ── Paths ───────────────────────────────────────────────────────────────────
 BASE_DIR="/home/woody/iwi7/iwi7107h/Esrlvr"
 TRAIN_PARQUET="${BASE_DIR}/Dataset parquet/pi1_r128.parquet"
-VAL_PARQUET="${BASE_DIR}/Dataset parquet/math500.parquet"
 OUT_DIR="${BASE_DIR}/outputs/results_${SLURM_JOB_ID}"
 
 mkdir -p "${OUT_DIR}"
@@ -51,35 +50,28 @@ unset RAY_GCS_SERVER_ADDRESS
 MODEL_NAME="${MODEL_NAME:-/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B}"
 SIGMA="${SIGMA:-0.001}"
 ALPHA="${ALPHA:-0.0005}"
-POPULATION_SIZE="${POPULATION_SIZE:-20}"
+POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-4}"
-NUM_ITERATIONS="${NUM_ITERATIONS:-200}"
+NUM_ITERATIONS="${NUM_ITERATIONS:-1500}"
 ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"
-VAL_EVERY="${VAL_EVERY:-10}"
-VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-50}"   # during-training eval; full 500 run post-training automatically
 GLOBAL_SEED="${GLOBAL_SEED:-42}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
-VAL_SHOW_N="${VAL_SHOW_N:-3}"       # show N math500 examples in full per eval
 
 SCRIPT="${BASE_DIR}/es_rlvr_train.py"
 
 python "${SCRIPT}" \
   --model_name        "${MODEL_NAME}" \
   --parquet_path      "${TRAIN_PARQUET}" \
-  --val_parquet_path  "${VAL_PARQUET}" \
   --sigma             "${SIGMA}" \
   --alpha             "${ALPHA}" \
   --population_size   "${POPULATION_SIZE}" \
   --num_engines       "${NUM_ENGINES}" \
   --num_iterations    "${NUM_ITERATIONS}" \
   --entropy_coeff     "${ENTROPY_COEFF}" \
-  --val_every         "${VAL_EVERY}" \
-  --val_batch_size    "${VAL_BATCH_SIZE}" \
   --cuda_devices      0,1,2,3 \
   --global_seed       "${GLOBAL_SEED}" \
   --experiment_dir    "${OUT_DIR}/es_experiment" \
   --output_every      "${OUTPUT_EVERY}" \
-  --val_show_n        "${VAL_SHOW_N}" \
   --antithetic \
   --verbose
 
