@@ -57,17 +57,15 @@ def compute_training_score(solution_str: str, ground_truth: str) -> float:
 
     Rules:
       1. Model output must contain \\boxed{<answer>}.
-      2. Extracted answer must equal ground_truth numerically (float, tol=1e-6).
-         e.g. "12.8", "12.80", "12.800000" all pass.
-         "12.9", "10", "\\frac{64}{5}" all fail.
-      3. No symbolic math, no string fuzzing — exact numeric match only.
+      2. Extracted answer must equal ground_truth as an exact string (strip only).
+         "12.8" passes; "12.80", "12.800", "12.888", "\\frac{64}{5}" all fail.
 
     Returns 1.0 (correct) or 0.0 (wrong).
     """
     model_answer = extract_answer(solution_str)
     if model_answer is None:
         return 0.0
-    return 1.0 if _is_numeric_match(model_answer, str(ground_truth)) else 0.0
+    return 1.0 if model_answer.strip() == str(ground_truth).strip() else 0.0
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, use_think=False):
