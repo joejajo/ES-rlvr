@@ -33,8 +33,10 @@ then NCCL-broadcast to all engines.
 """
 
 import argparse
+import csv as _csv
 from datetime import datetime
 import gc
+import json
 import os
 import re
 import random
@@ -163,8 +165,6 @@ def parse_args():
     parser.add_argument("--sigma", type=float, default=SIGMA)
     parser.add_argument("--alpha", type=float, default=ALPHA)
     parser.add_argument("--population_size", type=int, default=POPULATION_SIZE)
-    parser.add_argument("--iid_noise", action="store_true", default=False,
-                        help="Independent noise per parameter (vs shared noise).")
     # Training
     parser.add_argument("--num_engines", type=int, default=NUM_ENGINES)
     parser.add_argument("--num_iterations", type=int, default=NUM_ITERATIONS)
@@ -455,11 +455,10 @@ def _compute_token_entropy(output_obj) -> tuple:
 def _postprocess_outputs(outputs, task_datas: list,
                          debug_print: bool = False) -> dict:
     """
-    Compute per-sample rewards.
+    Compute per-sample rewards and collect all sample records for JSONL logging.
 
     Reward: binary correctness only.
       binary_reward = compute_score(...)  → 1.0 or 0.0
-      total         = binary_reward
 
     Entropy is computed and returned as a diagnostic metric but does NOT
     contribute to the reward signal used for ES normalisation.
@@ -471,23 +470,36 @@ def _postprocess_outputs(outputs, task_datas: list,
       avg_correctness    — mean binary correctness across batch
       avg_entropy        — mean per-token Shannon entropy (diagnostic only)
       avg_coverage       — mean top-20 probability mass coverage (diagnostic)
+      samples            — list of dicts, one per prompt/response pair (for JSONL)
     """
     correctness_scores = []
     total_scores = []
     entropy_vals = []
     coverage_vals = []
+    samples = []
 
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
         completion = output.outputs[0].text
         completion_for_reward = _truncate_after_first_boxed(completion)
         binary_reward = compute_training_score(completion_for_reward, data["ground_truth"])
         ent, cov = _compute_token_entropy(output)
-        total = binary_reward
 
         correctness_scores.append(binary_reward)
         entropy_vals.append(ent)
         coverage_vals.append(cov)
-        total_scores.append(total)
+        total_scores.append(binary_reward)
+
+        samples.append({
+            "sample_idx":       idx,
+            "prompt_str":       data.get("prompt_str", ""),
+            "question":         data.get("question", ""),
+            "model_response":   completion,
+            "extracted_answer": _extract_boxed(completion) or "",
+            "ground_truth":     data.get("ground_truth", ""),
+            "binary_reward":    binary_reward,
+            "entropy":          ent,
+            "entropy_coverage": cov,
+        })
 
         if debug_print and idx == 0:
             boxed = _extract_boxed(completion)
@@ -510,18 +522,6 @@ def _postprocess_outputs(outputs, task_datas: list,
             print(f"  Entropy (top-20) : {ent:.4f}  coverage={cov:.4f}")
             print("=" * 70 + "\n")
 
-    # first sample captured for train_outputs.csv
-    first = {}
-    if outputs and task_datas:
-        first_completion = outputs[0].outputs[0].text
-        first_completion = _truncate_after_first_boxed(first_completion)
-        first["question"]         = task_datas[0].get("question", "")
-        first["model_response"]   = first_completion
-        first["extracted_answer"] = _extract_boxed(first_completion) or ""
-        first["ground_truth"]     = task_datas[0].get("ground_truth", "")
-        first["binary_reward"]    = correctness_scores[0] if correctness_scores else 0.0
-        first["entropy"]          = entropy_vals[0]        if entropy_vals       else 0.0
-
     return {
         "scores":             total_scores,
         "correctness_scores": correctness_scores,
@@ -529,7 +529,7 @@ def _postprocess_outputs(outputs, task_datas: list,
         "avg_correctness":    float(np.mean(correctness_scores)) if correctness_scores else 0.0,
         "avg_entropy":        float(np.mean(entropy_vals))       if entropy_vals       else 0.0,
         "avg_coverage":       float(np.mean(coverage_vals))      if coverage_vals      else 0.0,
-        "first_sample":       first,
+        "samples":            samples,
     }
 
 
@@ -604,7 +604,6 @@ def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
 
     # ── Write val outputs CSV ─────────────────────────────────────────────────
     if val_outputs_path:
-        import csv as _csv
         file_exists = os.path.exists(val_outputs_path)
         with open(val_outputs_path, "a", newline="", encoding="utf-8") as f:
             fieldnames = ["iter", "example_idx", "question", "model_response",
@@ -834,11 +833,10 @@ def main(args):
         "val_iter":           [],
         "val_accuracy":       [],
     }
-    csv_path          = os.path.join(logging_dir, "metrics.csv")
-    train_outputs_csv = os.path.join(logging_dir, "train_outputs.csv")
-    val_outputs_csv   = os.path.join(logging_dir, "val_outputs.csv")
-    csv_header_written      = False
-    train_csv_header_written = False
+    csv_path           = os.path.join(logging_dir, "metrics.csv")
+    train_outputs_jsonl = os.path.join(logging_dir, "train_outputs.jsonl")
+    val_outputs_csv    = os.path.join(logging_dir, "val_outputs.csv")
+    csv_header_written = False
 
     # ── Pre-training baseline validation ─────────────────────────────────────
     if val_task_datas:
@@ -851,7 +849,6 @@ def main(args):
         history["val_iter"].append(-1)
         history["val_accuracy"].append(baseline_acc)
         with open(csv_path, "w", newline="") as f:
-            import csv as _csv
             w = _csv.DictWriter(f, fieldnames=[
                 "iter", "train_correctness", "reward_mean",
                 "reward_std", "entropy", "entropy_coverage", "val_accuracy",
@@ -892,7 +889,7 @@ def main(args):
                 break
             ray.get(llm.collective_rpc.remote(
                 "perturb_self_weights",
-                args=(seed, args.sigma, False, args.iid_noise),
+                args=(seed, args.sigma, False),
             ))
             handle, start_ts = evaluate_handle(llm, train_task_datas)
             inflight[handle] = {
@@ -932,7 +929,7 @@ def main(args):
             llm = meta["engine"]
             ray.get(llm.collective_rpc.remote(
                 "restore_self_weights",
-                args=(meta["seed"], args.sigma, args.iid_noise, False),
+                args=(meta["seed"], args.sigma),
             ))
 
             # Schedule next seed on this engine
@@ -943,7 +940,7 @@ def main(args):
 
             ray.get(llm.collective_rpc.remote(
                 "perturb_self_weights",
-                args=(next_seed, args.sigma, False, args.iid_noise),
+                args=(next_seed, args.sigma, False),
             ))
             handle, start_ts = evaluate_handle(llm, train_task_datas)
             inflight[handle] = {
@@ -1014,32 +1011,19 @@ def main(args):
         }
         write_mode = "w" if not csv_header_written else "a"
         with open(csv_path, write_mode, newline="") as f:
-            import csv as _csv
             w = _csv.DictWriter(f, fieldnames=list(csv_row.keys()))
             if not csv_header_written:
                 w.writeheader()
                 csv_header_written = True
             w.writerow(csv_row)
 
-        # ── Write one train output sample to train_outputs.csv ────────────────
-        # Pick first_sample from the first seed evaluated this iteration
-        _train_first = {}
-        for _v in seeds_perf.values():
-            _fs = _v.get("first_sample", {})
-            if _fs:
-                _train_first = _fs
-                break
-        import csv as _csv
-        _train_csv_mode = "w" if not train_csv_header_written else "a"
-        with open(train_outputs_csv, _train_csv_mode, newline="", encoding="utf-8") as _f:
-            _train_fields = ["iter", "question", "model_response", "extracted_answer",
-                             "ground_truth", "binary_reward", "entropy"]
-            _tw = _csv.DictWriter(_f, fieldnames=_train_fields)
-            if not train_csv_header_written:
-                _tw.writeheader()
-                train_csv_header_written = True
-            if _train_first:
-                _tw.writerow({"iter": i, **_train_first})
+        # ── Write all train outputs to JSONL (all seeds, all samples) ───────────
+        with open(train_outputs_jsonl, "a", encoding="utf-8") as _jf:
+            for s, v in seeds_perf.items():
+                for sample in v.get("samples", []):
+                    record = {"iter": i, "seed": s}
+                    record.update(sample)
+                    _jf.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         # ── ES weight update on engine 0 ──────────────────────────────────────
         # Standard ES: Δθ += (α/N) × Aᵢ × εᵢ
@@ -1052,7 +1036,7 @@ def main(args):
             if coeff != 0.0:
                 handles.append(engines[0].collective_rpc.remote(
                     "perturb_self_weights",
-                    args=(s, coeff, False, args.iid_noise),
+                    args=(s, coeff, False),
                 ))
 
         ray.get(handles)
@@ -1091,7 +1075,6 @@ def main(args):
             history["val_accuracy"].append(val_acc)
             # Update CSV val_accuracy column for this iter (append a marker row)
             with open(csv_path, "a", newline="") as f:
-                import csv as _csv
                 w = _csv.DictWriter(f, fieldnames=[
                     "iter", "train_correctness", "reward_mean",
                     "reward_std", "entropy", "entropy_coverage", "val_accuracy",
