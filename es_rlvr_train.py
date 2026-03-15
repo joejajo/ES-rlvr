@@ -218,14 +218,9 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
         reward_model = row["reward_model"]
         gt = reward_model["ground_truth"] if isinstance(reward_model, dict) else str(reward_model)
         ds = str(row.get("data_source", "deepscaler"))
-        # Prepend system prompt — matching es_fine_tuning_deepscaler_accl.py
-        chat_with_system = [{"role": "system", "content": SYSTEM_PROMPT}] + chat
         prompt_str = tokenizer.apply_chat_template(
-            chat_with_system, tokenize=False, add_generation_prompt=True
+            chat, tokenize=False, add_generation_prompt=True
         )
-        # Prepend a reasoning starter so the model produces visible CoT
-        # instead of short one-liner answers.
-        prompt_str += "Let me think step by step.\n\n"
         # Extract the raw user question for display (first user-role message)
         question = ""
         for msg in chat:
