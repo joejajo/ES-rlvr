@@ -246,8 +246,8 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 # Generation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
-                    max_tokens: int = 3072):
+def evaluate_handle(llm, task_datas: list, temperature: float = 1.0,
+                    max_tokens: int = 3072, min_tokens: int = 200):
     """
     Launch an async vLLM generation on llm.
     logprobs=1 → per-token logprob of the sampled token, used as entropy proxy.
@@ -256,8 +256,9 @@ def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
     prompts = [d["prompt_str"] for d in task_datas]
     sampling_params = SamplingParams(
         temperature=temperature,
+        min_tokens=min_tokens,   # prevent lazy one-liner responses
         max_tokens=max_tokens,
-        logprobs=20,         # top-20 for Shannon entropy approximation (vLLM max)
+        logprobs=20,             # top-20 for Shannon entropy approximation (vLLM max)
     )
     handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
     return handle, time.time()
