@@ -21,7 +21,6 @@ One-Shot-RLVR design principles preserved
   forward pass.  In a pure vLLM inference architecture there is no
   autograd model resident in memory, so this term is not feasible
   without a separate HuggingFace inference pass per perturbation.
-- On-the-go validation on math500 every val_every iterations.
 - Model output display during training (every iter by default).
 
 ES weight update (standard, matches VsonicV countdown_accl)
@@ -33,7 +32,7 @@ then NCCL-broadcast to all engines.
 """
 
 import argparse
-import csv as _csv
+
 from datetime import datetime
 import gc
 import json
@@ -79,53 +78,7 @@ except ImportError:
             s.bind(("", 0))
             return s.getsockname()[1]
 
-from deepscaler import compute_training_score, compute_score, SYSTEM_PROMPT
-
-# ── qwen25-math-cot val prompt (matches One-Shot-RLVR eval exactly) ───────────
-# Template: system + all demos + actual question in one user turn.
-# 1-shot demo for math500: the wind-pressure problem (same as pi1_r128 train Q).
-_QWEN_COT_SYSTEM = "Please reason step by step, and put your final answer within \\boxed{}."
-_QWEN_COT_1SHOT_Q = (
-    "The pressure \\( P \\) exerted by wind on a sail varies jointly as the area"
-    " \\( A \\) of the sail and the cube of the wind's velocity \\( V \\). When"
-    " the velocity is \\( 8 \\) miles per hour, the pressure on a sail of"
-    " \\( 2 \\) square feet is \\( 4 \\) pounds. Find the wind velocity when the"
-    " pressure on \\( 4 \\) square feet of sail is \\( 32 \\) pounds."
-    " Let's think step by step and output the final answer within \\boxed{}."
-)
-_QWEN_COT_1SHOT_A = (
-    "We start by writing the mathematical relationship for the pressure \\( P \\):\n"
-    "\\[ P = k \\cdot A \\cdot V^3 \\]\n"
-    "where \\( k \\) is a constant. We need to find \\( k \\) using the given information:\n"
-    "\\[ 4 = k \\cdot 2 \\cdot 8^3 \\]\n"
-    "Solving for \\( k \\):\n"
-    "\\[ 4 = k \\cdot 2 \\cdot 512 \\]\n"
-    "\\[ 4 = 1024k \\]\n"
-    "\\[ k = \\frac{4}{1024} \\]\n"
-    "\\[ k = \\frac{1}{256} \\]\n"
-    "Now we use this value of \\( k \\) to find the velocity \\( V \\) when the"
-    " pressure \\( P \\) on 4 square feet of sail is 32 pounds:\n"
-    "\\[ 32 = \\frac{1}{256} \\cdot 4 \\cdot V^3 \\]\n"
-    "\\[ 32 = \\frac{V^3}{64} \\]\n"
-    "\\[ 32 \\cdot 64 = V^3 \\]\n"
-    "\\[ 2048 = V^3 \\]\n"
-    "\\[ V = \\sqrt[3]{2048} \\]\n"
-    "\\[ V = 12.8 \\]\n"
-    "Thus, the wind velocity is \\( \\boxed{12.8} \\) miles per hour."
-)
-
-def _build_qwen_cot_prompt(question: str) -> str:
-    """
-    Builds a qwen25-math-cot prompt: system + 1-shot demo + question
-    in a single user turn, exactly as One-Shot-RLVR eval does.
-    """
-    demo = f"{_QWEN_COT_1SHOT_Q}\n\n{_QWEN_COT_1SHOT_A}"
-    user_content = f"{demo}\n\n{question}"
-    return (
-        f"<|im_start|>system\n{_QWEN_COT_SYSTEM}<|im_end|>\n"
-        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
-    )
+from deepscaler import compute_training_score, SYSTEM_PROMPT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +90,6 @@ ALPHA            = 0.0005         # ES learning rate α
 POPULATION_SIZE  = 20             # number of perturbations per iteration
 NUM_ENGINES      = 4              # parallel vLLM engines (= GPUs)
 NUM_ITERATIONS   = 200
-VAL_EVERY        = 10             # evaluate on math500 every N iterations
 EXPERIMENT_DIR   = "outputs/es_rlvr_oneshot"
 
 
@@ -156,11 +108,6 @@ def parse_args():
     parser.add_argument("--parquet_path", type=str,
                         default="Dataset parquet/pi1_r128.parquet",
                         help="Train parquet (verl schema). One-shot: pi1_r128.")
-    parser.add_argument("--val_parquet_path", type=str,
-                        default="Dataset parquet/math500.parquet",
-                        help="Validation parquet (verl schema). math500.")
-    parser.add_argument("--val_batch_size", type=int, default=50,
-                        help="Number of val examples to evaluate each val step (full 500 run post-training).")
     # ES
     parser.add_argument("--sigma", type=float, default=SIGMA)
     parser.add_argument("--alpha", type=float, default=ALPHA)
@@ -168,14 +115,11 @@ def parse_args():
     # Training
     parser.add_argument("--num_engines", type=int, default=NUM_ENGINES)
     parser.add_argument("--num_iterations", type=int, default=NUM_ITERATIONS)
-    parser.add_argument("--val_every", type=int, default=VAL_EVERY)
     parser.add_argument("--experiment_dir", type=str, default=EXPERIMENT_DIR)
     parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
     parser.add_argument("--global_seed", type=int, default=None)
     parser.add_argument("--output_every", type=int, default=1,
                         help="Print prompt+response sample every N training iterations (default: 1 = every iter).")
-    parser.add_argument("--val_show_n", type=int, default=3,
-                        help="Number of Math500 examples to display in full at each val step.")
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -249,42 +193,6 @@ def launch_engines(num_engines: int, model_path: str):
 # Data loading  (verl parquet schema)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_val_task_datas(parquet_path: str) -> list:
-    """
-    Load val parquet using the qwen25-math-cot prompt format (One-Shot-RLVR eval).
-    Does NOT need the tokenizer — prompt is built directly as a raw string.
-    """
-    if not os.path.exists(parquet_path):
-        raise FileNotFoundError(
-            f"Parquet not found: {parquet_path}\n"
-            "Pass the correct path via --val_parquet_path"
-        )
-    df = pd.read_parquet(parquet_path)
-    if len(df) == 0:
-        raise RuntimeError(f"Parquet has zero rows: {parquet_path}")
-
-    task_datas = []
-    for _, row in df.iterrows():
-        chat = list(row["prompt"])
-        reward_model = row["reward_model"]
-        gt = reward_model["ground_truth"] if isinstance(reward_model, dict) else str(reward_model)
-        ds = str(row.get("data_source", "deepscaler"))
-        # extract raw question from first user message
-        question = ""
-        for msg in chat:
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                question = msg.get("content", "")
-                break
-        prompt_str = _build_qwen_cot_prompt(question)
-        task_datas.append({
-            "prompt_str":   prompt_str,
-            "ground_truth": str(gt),
-            "data_source":  ds,
-            "question":     question,
-        })
-    return task_datas
-
-
 def load_task_datas(parquet_path: str, tokenizer) -> list:
     """
     Load a verl-schema parquet file.
@@ -302,7 +210,7 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
     if not os.path.exists(parquet_path):
         raise FileNotFoundError(
             f"Parquet not found: {parquet_path}\n"
-            "Pass the correct path via --parquet_path / --val_parquet_path"
+            "Pass the correct path via --parquet_path"
         )
     df = pd.read_parquet(parquet_path)
     if len(df) == 0:
@@ -534,177 +442,57 @@ def _postprocess_outputs(outputs, task_datas: list,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Validation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def evaluate_val_set(engine, val_task_datas: list, val_batch_size: int,
-                     iteration: int, writer, val_show_n: int = 3,
-                     val_outputs_path: str = None) -> float:
-    """
-    On-the-go greedy evaluation on math500 (or any val set).
-
-    Uses engine 0, which holds the current best weights after each ES update
-    and NCCL broadcast.  Greedy decoding (temperature=0) for deterministic
-    accuracy.
-
-    Shows the question, full reasoning chain, extracted answer and
-    correct/wrong label for the first val_show_n examples.
-    """
-    batch = val_task_datas[:val_batch_size] if val_batch_size > 0 else val_task_datas
-    prompts = [d["prompt_str"] for d in batch]
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=3072,
-        stop=["<|im_end|>", "<|im_start|>"],  # stop at end of assistant turn
-    )
-
-    print(f"\n{'#' * 70}")
-    print(f"  [VAL] Iter {iteration} — Math500 greedy eval on {len(batch)} examples")
-    print(f"{'#' * 70}")
-    outputs = ray.get(engine.generate.remote(prompts, sampling_params, use_tqdm=False))
-
-    correct = 0.0
-    correctness_list = []
-    for output, data in zip(outputs, batch):
-        completion_for_reward = _truncate_after_first_boxed(output.outputs[0].text)
-        c    = compute_score(data.get("data_source", "math500"), completion_for_reward, data["ground_truth"])
-        correct += c
-        correctness_list.append(c)
-
-    accuracy = correct / len(batch)
-
-    # Show all evaluated examples: compact header + full CoT
-    for idx in range(len(batch)):
-        data = batch[idx]
-        completion = _truncate_after_first_boxed(outputs[idx].outputs[0].text)
-        extracted = _extract_boxed(completion) or ""
-        is_correct = correctness_list[idx] == 1.0
-        result_tag = "✓ CORRECT" if is_correct else "✗ WRONG"
-        # Full CoT for val_show_n examples; compact (500 chars) for the rest
-        if idx < val_show_n:
-            display_resp = completion if len(completion) <= 2000 else completion[:2000] + "\n  ... [truncated]"
-        else:
-            display_resp = completion[:500] + " ... [truncated]" if len(completion) > 500 else completion
-
-        print(f"\n{'─' * 70}")
-        print(f"[VAL {idx + 1}/{len(batch)}]  {result_tag}")
-        print(f"  Q : {data.get('question', '')[:120]}")
-        print(f"  GT: {data['ground_truth']}   PRED: {extracted if extracted else '(none)'}")
-        if idx < val_show_n:
-            print("─" * 70)
-            print("[REASONING CHAIN]")
-            for line in display_resp.splitlines():
-                print(f"  {line}")
-        else:
-            print(f"  CoT: {display_resp[:200].replace(chr(10), ' ')}")
-        print("─" * 70)
-
-    print(f"\n[VAL] accuracy = {accuracy:.4f}  ({int(correct)}/{len(batch)})")
-    print(f"{'#' * 70}\n")
-
-    # ── Write val outputs CSV ─────────────────────────────────────────────────
-    if val_outputs_path:
-        file_exists = os.path.exists(val_outputs_path)
-        with open(val_outputs_path, "a", newline="", encoding="utf-8") as f:
-            fieldnames = ["iter", "example_idx", "question", "model_response",
-                          "extracted_answer", "ground_truth", "correct"]
-            w = _csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists:
-                w.writeheader()
-            for idx, (data, completion, score) in enumerate(
-                zip(batch, [_truncate_after_first_boxed(o.outputs[0].text) for o in outputs], correctness_list)
-            ):
-                w.writerow({
-                    "iter":             iteration,
-                    "example_idx":      idx,
-                    "question":         data.get("question", ""),
-                    "model_response":   completion,
-                    "extracted_answer": _extract_boxed(completion) or "",
-                    "ground_truth":     data["ground_truth"],
-                    "correct":          int(score),
-                })
-
-    if writer is not None:
-        writer.add_scalar("val/accuracy", accuracy, iteration)
-    return accuracy
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Plotting
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_plots(history: dict, output_dir: str):
     """
-    Save thesis-quality training curves as a single PNG figure.
+    Save training curves as a single PNG figure.
 
     Panels:
-      (top-left)     Train correctness vs iteration
-      (top-right)    Math500 val accuracy vs iteration  (with baseline marker)
-      (bottom-left)  ES reward mean ± std band vs iteration
-      (bottom-right) Response entropy proxy vs iteration
+      (left)   Train correctness vs iteration
+      (centre) ES reward mean ± std band vs iteration
+      (right)  Response entropy proxy vs iteration
     """
     iters = history["iter"]
     if not iters:
         return
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
-    fig.suptitle(
-        "ES-RLVR  ·  One-Shot Training on Single Example → Math500 Generalisation",
-        fontsize=13, fontweight="bold", y=1.01,
-    )
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle("ES-RLVR  ·  One-Shot Training", fontsize=13, fontweight="bold")
 
-    # ── Top-left: train correctness ──────────────────────────────────────────
-    ax = axes[0, 0]
+    # ── Left: train correctness ───────────────────────────────────────────────
+    ax = axes[0]
     ax.plot(iters, history["train_correctness"],
             color="tab:blue", linewidth=1.5, label="train correctness")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Mean Correctness")
-    ax.set_title("Training Correctness (single example)")
+    ax.set_title("Training Correctness")
     ax.set_ylim(-0.05, 1.10)
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9)
 
-    # ── Top-right: val accuracy ───────────────────────────────────────────────
-    ax = axes[0, 1]
-    if history["val_iter"]:
-        ax.plot(history["val_iter"], history["val_accuracy"],
-                color="tab:orange", marker="o", linewidth=2,
-                markersize=5, label="Math500 accuracy")
-        baseline = history["val_accuracy"][0]
-        ax.axhline(baseline, linestyle="--", color="gray", alpha=0.7,
-                   label=f"Baseline {baseline:.1%}")
-        best = max(history["val_accuracy"])
-        ax.axhline(best, linestyle=":", color="tab:green", alpha=0.7,
-                   label=f"Best {best:.1%}")
-        ax.legend(fontsize=9)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Math500 Validation Accuracy")
-    ax.set_ylim(-0.05, 1.10)
-    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
-    ax.grid(True, alpha=0.3)
-
-    # ── Bottom-left: reward mean ± std ────────────────────────────────────────
-    ax = axes[1, 0]
+    # ── Centre: reward mean ± std ─────────────────────────────────────────────
+    ax = axes[1]
     means = np.array(history["reward_mean"])
     stds  = np.array(history["reward_std"])
     ax.plot(iters, means, color="tab:green", linewidth=1.5, label="mean reward")
     ax.fill_between(iters, means - stds, means + stds,
                     alpha=0.20, color="tab:green", label="±1 std")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("Total Reward (binary correctness)")
+    ax.set_ylabel("Reward (binary correctness)")
     ax.set_title("ES Population Reward")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # ── Bottom-right: entropy proxy ───────────────────────────────────────────
-    ax = axes[1, 1]
+    # ── Right: entropy proxy ──────────────────────────────────────────────────
+    ax = axes[2]
     ax.plot(iters, history["entropy"],
             color="tab:purple", linewidth=1.5, label="H (top-20 + tail)")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Shannon entropy  H (nats/token)")
-    ax.set_title("Response Token Entropy (top-20 approx)")
+    ax.set_title("Response Token Entropy")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
@@ -759,15 +547,6 @@ def main(args):
     train_task_datas = load_task_datas(args.parquet_path, tokenizer)
     print(f"[DATA] {len(train_task_datas)} train examples loaded.")
 
-    val_task_datas = None
-    if args.val_parquet_path and os.path.exists(args.val_parquet_path):
-        print(f"[DATA] Loading val:   {args.val_parquet_path}")
-        val_task_datas = load_val_task_datas(args.val_parquet_path)
-        print(f"[DATA] {len(val_task_datas)} val examples loaded.")
-    else:
-        print(f"[DATA] Val path not found ({args.val_parquet_path}), "
-              f"skipping validation.")
-
     # ── Launch engines ────────────────────────────────────────────────────────
     print(f"\n[ENGINES] Launching {args.num_engines} vLLM engines...")
     engines, pgs = launch_engines(args.num_engines, base_model_path)
@@ -817,8 +596,6 @@ def main(args):
     print(f"  Engines (GPUs) : {args.num_engines}")
     print(f"  Iterations     : {args.num_iterations}")
     print(f"  Train examples : {len(train_task_datas)}")
-    print(f"  Val examples   : {len(val_task_datas) if val_task_datas else 'N/A'}")
-    print(f"  Val every      : {args.val_every} iters")
     print(f"  Log dir        : {logging_dir}")
     print("=" * 70 + "\n")
 
@@ -830,36 +607,8 @@ def main(args):
         "reward_std":         [],
         "entropy":            [],
         "entropy_coverage":   [],
-        "val_iter":           [],
-        "val_accuracy":       [],
     }
-    csv_path           = os.path.join(logging_dir, "metrics.csv")
     train_outputs_jsonl = os.path.join(logging_dir, "train_outputs.jsonl")
-    val_outputs_csv    = os.path.join(logging_dir, "val_outputs.csv")
-    csv_header_written = False
-
-    # ── Pre-training baseline validation ─────────────────────────────────────
-    if val_task_datas:
-        print("[BASELINE] Evaluating before any training...")
-        baseline_acc = evaluate_val_set(
-            engines[0], val_task_datas, args.val_batch_size,
-            -1, writer, val_show_n=args.val_show_n,
-            val_outputs_path=val_outputs_csv,
-        )
-        history["val_iter"].append(-1)
-        history["val_accuracy"].append(baseline_acc)
-        with open(csv_path, "w", newline="") as f:
-            w = _csv.DictWriter(f, fieldnames=[
-                "iter", "train_correctness", "reward_mean",
-                "reward_std", "entropy", "entropy_coverage", "val_accuracy",
-            ])
-            w.writeheader()
-            w.writerow({
-                "iter": "baseline", "train_correctness": "",
-                "reward_mean": "", "reward_std": "",
-                "entropy": "", "entropy_coverage": "", "val_accuracy": baseline_acc,
-            })
-        csv_header_written = True
 
     # ──────────────────────────────────────────────────────────────────────────
     # Training loop
@@ -1000,23 +749,6 @@ def main(args):
         history["entropy"].append(mean_e)
         history["entropy_coverage"].append(mean_cov)
 
-        csv_row = {
-            "iter":              i,
-            "train_correctness": mean_c,
-            "reward_mean":       mean_r,
-            "reward_std":        std_r,
-            "entropy":           mean_e,
-            "entropy_coverage":  mean_cov,
-            "val_accuracy":      "",   # filled in at val steps
-        }
-        write_mode = "w" if not csv_header_written else "a"
-        with open(csv_path, write_mode, newline="") as f:
-            w = _csv.DictWriter(f, fieldnames=list(csv_row.keys()))
-            if not csv_header_written:
-                w.writeheader()
-                csv_header_written = True
-            w.writerow(csv_row)
-
         # ── Write all train outputs to JSONL (all seeds, all samples) ───────────
         with open(train_outputs_jsonl, "a", encoding="utf-8") as _jf:
             for s, v in seeds_perf.items():
@@ -1062,30 +794,6 @@ def main(args):
         print(f"[ITER] Wall clock: {t_iter:.1f}s")
         print(f"  Generation {i} done.\n")
 
-        # ── On-the-go validation ──────────────────────────────────────────────
-        if val_task_datas and (
-            i % args.val_every == 0 or i == args.num_iterations - 1
-        ):
-            val_acc = evaluate_val_set(
-                engines[0], val_task_datas, args.val_batch_size,
-                i, writer, val_show_n=args.val_show_n,
-                val_outputs_path=val_outputs_csv,
-            )
-            history["val_iter"].append(i)
-            history["val_accuracy"].append(val_acc)
-            # Update CSV val_accuracy column for this iter (append a marker row)
-            with open(csv_path, "a", newline="") as f:
-                w = _csv.DictWriter(f, fieldnames=[
-                    "iter", "train_correctness", "reward_mean",
-                    "reward_std", "entropy", "entropy_coverage", "val_accuracy",
-                ])
-                w.writerow({
-                    "iter": f"val@{i}", "train_correctness": "",
-                    "reward_mean": "", "reward_std": "",
-                    "entropy": "", "entropy_coverage": "", "val_accuracy": val_acc,
-                })
-            save_plots(history, logging_dir)
-
     # ── Save final model weights ──────────────────────────────────────────────
     final_path = f"{model_saves_dir}/final_model_iter_{args.num_iterations}"
     os.makedirs(final_path, exist_ok=True)
@@ -1097,22 +805,8 @@ def main(args):
     )
     print(f"\n[SAVE] Final weights saved to {final_path}/pytorch_model.pth")
 
-    # ── Full math500 evaluation after training ────────────────────────────────
-    if val_task_datas:
-        print("\n" + "=" * 70)
-        print("  POST-TRAINING: Full Math500 Evaluation (500 examples, greedy)")
-        print("=" * 70)
-        final_acc = evaluate_val_set(
-            engines[0], val_task_datas, len(val_task_datas),
-            iteration=args.num_iterations, writer=writer,
-            val_show_n=args.val_show_n,
-            val_outputs_path=val_outputs_csv,
-        )
-        print(f"\n[FINAL] Math500 accuracy = {final_acc:.4f}  ({int(final_acc * len(val_task_datas))}/{len(val_task_datas)})")
-        writer.add_scalar("val/final_accuracy", final_acc, args.num_iterations)
-
     save_plots(history, logging_dir)
-    print(f"[CSV]  Metrics log → {csv_path}")
+
 
     cleanup()
     writer.close()
