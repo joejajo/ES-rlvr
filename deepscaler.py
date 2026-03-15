@@ -1,41 +1,6 @@
 import re
 
-try:
-    from verl.utils.reward_score.utils import extract_answer, grade_answer_sympy, grade_answer_mathd  # pyright: ignore[reportMissingImports]
-except ImportError:
-    try:
-        from verl.utils.reward_score.utils.utils import extract_answer, grade_answer_sympy, grade_answer_mathd  # pyright: ignore[reportMissingImports]
-    except ImportError:
-        def extract_answer(text):
-            if text is None:
-                return None
-            s = str(text)
-            # Use the LAST \boxed{} (rfind), matching One-Shot-RLVR behaviour.
-            idx = s.rfind(r"\boxed")
-            if idx == -1:
-                return None
-            # Advance past \boxed and optional whitespace to the opening brace.
-            i = idx + len(r"\boxed")
-            while i < len(s) and s[i] == " ":
-                i += 1
-            if i >= len(s) or s[i] != "{":
-                return None
-            depth = 0
-            start = i + 1  # content starts after the opening brace
-            for j in range(i, len(s)):
-                if s[j] == "{":
-                    depth += 1
-                elif s[j] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return s[start:j].strip()
-            return None
-
-        def grade_answer_sympy(model_answer, ground_truth):
-            return str(model_answer).strip() == str(ground_truth).strip()
-
-        def grade_answer_mathd(model_answer, ground_truth):
-            return str(model_answer).strip() == str(ground_truth).strip()
+from utils.reward_utils import extract_answer, grade_answer_sympy, grade_answer_mathd
 
 
 # System prompt — matches One-Shot-RLVR / qwen25-math-cot exactly.
