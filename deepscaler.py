@@ -10,12 +10,11 @@ except ImportError:
             if text is None:
                 return None
             s = str(text)
-            # Find \boxed{ and then use brace-counting to handle nested LaTeX
-            # e.g. \boxed{\frac{14}{3}} — [^}]* regex would stop at the first }
-            idx = s.find(r"\boxed")
+            # Use the LAST \boxed{} (rfind), matching One-Shot-RLVR behaviour.
+            idx = s.rfind(r"\boxed")
             if idx == -1:
                 return None
-            # advance past \boxed and optional whitespace to the opening brace
+            # Advance past \boxed and optional whitespace to the opening brace.
             i = idx + len(r"\boxed")
             while i < len(s) and s[i] == " ":
                 i += 1
@@ -43,29 +42,28 @@ except ImportError:
 SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
 
 
-def _is_numeric_match(a, b, tol=1e-6):
-    """Return True if both strings represent numbers within tolerance."""
-    try:
-        return abs(float(a) - float(b)) < tol
-    except (ValueError, TypeError):
-        return False
-
-
 def compute_training_score(solution_str: str, ground_truth: str) -> float:
     """
-    Training-only reward for pi1_r128 (single question, GT = "12.8").
-
-    Rules:
-      1. Model output must contain \\boxed{<answer>}.
-      2. Extracted answer must equal ground_truth as an exact string (strip only).
-         "12.8" passes; "12.80", "12.800", "12.888", "\\frac{64}{5}" all fail.
+    Training reward. Identical grading logic to compute_score:
+      1. Model output must contain \\boxed{<answer>} (last occurrence used).
+      2. Ground truth that contains \\boxed{} is unwrapped the same way.
+      3. Correct iff grade_answer_mathd OR grade_answer_sympy.
 
     Returns 1.0 (correct) or 0.0 (wrong).
     """
     model_answer = extract_answer(solution_str)
     if model_answer is None:
         return 0.0
-    return 1.0 if model_answer.strip() == str(ground_truth).strip() else 0.0
+
+    gt = str(ground_truth)
+    if "\\boxed" in gt:
+        gt = extract_answer(gt)
+        if gt is None:
+            return 0.0
+
+    if grade_answer_mathd(model_answer, gt) or grade_answer_sympy(model_answer, gt):
+        return 1.0
+    return 0.0
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, use_think=False):
@@ -110,11 +108,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, use_
 
     # Step 4: strict correctness check.
     for gt in processed_ground_truths:
-        if (
-            grade_answer_mathd(model_answer, gt)
-            or grade_answer_sympy(model_answer, gt)
-            or _is_numeric_match(model_answer, gt)
-        ):
+        if grade_answer_mathd(model_answer, gt) or grade_answer_sympy(model_answer, gt):
             return 1.0
 
     return 0.0
