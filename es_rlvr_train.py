@@ -246,8 +246,8 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 # Generation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_handle(llm, task_datas: list, temperature: float = 1.0,
-                    max_tokens: int = 3072, min_tokens: int = 200):
+def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
+                    max_tokens: int = 4032, min_tokens: int = 200):
     """
     Launch an async vLLM generation on llm.
     logprobs=1 → per-token logprob of the sampled token, used as entropy proxy.
