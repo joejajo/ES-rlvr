@@ -223,6 +223,9 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
         prompt_str = tokenizer.apply_chat_template(
             chat_with_system, tokenize=False, add_generation_prompt=True
         )
+        # Prepend a reasoning starter so the model produces visible CoT
+        # instead of short one-liner answers.
+        prompt_str += "Let me think step by step.\n\n"
         # Extract the raw user question for display (first user-role message)
         question = ""
         for msg in chat:
