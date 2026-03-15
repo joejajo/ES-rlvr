@@ -253,7 +253,6 @@ def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
     prompts = [d["prompt_str"] for d in task_datas]
     sampling_params = SamplingParams(
         temperature=temperature,
-        seed=42,
         max_tokens=max_tokens,
         logprobs=20,         # top-20 for Shannon entropy approximation (vLLM max)
     )
