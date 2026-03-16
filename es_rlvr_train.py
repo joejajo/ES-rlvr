@@ -656,11 +656,10 @@ def main(args):
         for s in seeds:
             norm  = seeds_perf.get(s, {}).get("norm_reward", 0.0)
             coeff = (args.alpha / args.population_size) * norm
-            if coeff != 0.0:
-                handles.append(engines[0].collective_rpc.remote(
-                    "perturb_self_weights",
-                    args=(s, coeff, False),
-                ))
+            handles.append(engines[0].collective_rpc.remote(
+                "perturb_self_weights",
+                args=(s, coeff, False),
+            ))
 
         ray.get(handles)
         t_perturb = time.time() - perturb_start
