@@ -81,47 +81,6 @@ from deepscaler import compute_training_score, SYSTEM_PROMPT
 from utils.os_parser import extract_answer as os_extract_answer
 from utils.math500_eval import grade_answer as grade_math500
 
-# ── qwen25-math-cot val prompt (matches One-Shot-RLVR eval exactly) ───────────
-_QWEN_COT_SYSTEM = "Please reason step by step, and put your final answer within \\boxed{}."
-_QWEN_COT_1SHOT_Q = (
-    "The pressure \\( P \\) exerted by wind on a sail varies jointly as the area"
-    " \\( A \\) of the sail and the cube of the wind's velocity \\( V \\). When"
-    " the velocity is \\( 8 \\) miles per hour, the pressure on a sail of"
-    " \\( 2 \\) square feet is \\( 4 \\) pounds. Find the wind velocity when the"
-    " pressure on \\( 4 \\) square feet of sail is \\( 32 \\) pounds."
-    " Let's think step by step and output the final answer within \\boxed{}."
-)
-_QWEN_COT_1SHOT_A = (
-    "We start by writing the mathematical relationship for the pressure \\( P \\):\n"
-    "\\[ P = k \\cdot A \\cdot V^3 \\]\n"
-    "where \\( k \\) is a constant. We need to find \\( k \\) using the given information:\n"
-    "\\[ 4 = k \\cdot 2 \\cdot 8^3 \\]\n"
-    "Solving for \\( k \\):\n"
-    "\\[ 4 = k \\cdot 2 \\cdot 512 \\]\n"
-    "\\[ 4 = 1024k \\]\n"
-    "\\[ k = \\frac{4}{1024} \\]\n"
-    "\\[ k = \\frac{1}{256} \\]\n"
-    "Now we use this value of \\( k \\) to find the velocity \\( V \\) when the"
-    " pressure \\( P \\) on 4 square feet of sail is 32 pounds:\n"
-    "\\[ 32 = \\frac{1}{256} \\cdot 4 \\cdot V^3 \\]\n"
-    "\\[ 32 = \\frac{V^3}{64} \\]\n"
-    "\\[ 32 \\cdot 64 = V^3 \\]\n"
-    "\\[ 2048 = V^3 \\]\n"
-    "\\[ V = \\sqrt[3]{2048} \\]\n"
-    "\\[ V = 12.8 \\]\n"
-    "Thus, the wind velocity is \\( \\boxed{12.8} \\) miles per hour."
-)
-
-
-def _build_qwen_cot_prompt(question: str) -> str:
-    demo = f"{_QWEN_COT_1SHOT_Q}\n\n{_QWEN_COT_1SHOT_A}"
-    user_content = f"{demo}\n\n{question}"
-    return (
-        f"<|im_start|>system\n{_QWEN_COT_SYSTEM}<|im_end|>\n"
-        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-        f"<|im_start|>assistant\n"
-    )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default hyperparameters
@@ -234,7 +193,7 @@ def launch_engines(num_engines: int, model_path: str):
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_val_task_datas(parquet_path: str) -> list:
+def load_val_task_datas(parquet_path: str, tokenizer) -> list:
     if not os.path.exists(parquet_path):
         raise FileNotFoundError(f"Parquet not found: {parquet_path}")
     df = pd.read_parquet(parquet_path)
@@ -247,12 +206,15 @@ def load_val_task_datas(parquet_path: str) -> list:
         reward_model = row["reward_model"]
         gt = reward_model["ground_truth"] if isinstance(reward_model, dict) else str(reward_model)
         ds = str(row.get("data_source", "deepscaler"))
+        chat_with_system = [{"role": "system", "content": SYSTEM_PROMPT}] + chat
+        prompt_str = tokenizer.apply_chat_template(
+            chat_with_system, tokenize=False, add_generation_prompt=True
+        )
         question = ""
         for msg in chat:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 question = msg.get("content", "")
                 break
-        prompt_str = _build_qwen_cot_prompt(question)
         task_datas.append({
             "prompt_str":   prompt_str,
             "ground_truth": str(gt),
@@ -684,7 +646,7 @@ def main(args):
     val_task_datas = None
     if args.val_parquet_path and os.path.exists(args.val_parquet_path):
         print(f"[DATA] Loading val:   {args.val_parquet_path}")
-        val_task_datas = load_val_task_datas(args.val_parquet_path)
+        val_task_datas = load_val_task_datas(args.val_parquet_path, tokenizer)
         print(f"[DATA] {len(val_task_datas)} val examples loaded.")
     else:
         print(f"[DATA] Val path not found ({args.val_parquet_path}), skipping validation.")
