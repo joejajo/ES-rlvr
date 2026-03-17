@@ -32,7 +32,7 @@ python esrlvr42.py \
     --cuda_devices      0,1,2,3 \
     --sigma             0.001 \
     --alpha             0.0005 \
-    --population_size   20 \
+    --population_size   30 \
     --num_iterations    200 \
     --experiment_dir    outputs/esrlvr42 \
     --output_every      1

@@ -62,7 +62,7 @@ from deepscaler import compute_training_score, SYSTEM_PROMPT
 
 SIGMA           = 0.001
 ALPHA           = 0.0005
-POPULATION_SIZE = 20
+POPULATION_SIZE = 30
 NUM_ENGINES     = 4
 NUM_ITERATIONS  = 200
 EXPERIMENT_DIR  = "outputs/esrlvr42"
