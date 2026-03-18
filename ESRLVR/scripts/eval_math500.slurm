@@ -12,31 +12,19 @@
 conda activate grpo
 cd "$SLURM_SUBMIT_DIR"
 
-MODEL="Qwen/Qwen2.5-Math-1.5B-Instruct"
-VAL_PARQUET="data/val/math500.parquet"
-OUTPUT_DIR="outputs/val_preds"
-TP=4
-DEVICES="0,1,2,3"
-TEMPERATURE=0.0
-MAX_TOKENS=3072
-N_SAMPLES=1
-
-# Set to evaluate a trained checkpoint; leave empty for base model.
-# WEIGHTS_PTH="checkpoints/final_model_iter_200_YYYYMMDD_HHMMSS/pytorch_model.pth"
+# Set WEIGHTS_PTH to evaluate a trained checkpoint; leave empty for base model.
+# WEIGHTS_PTH="checkpoints/final_iter200_YYYYMMDD_HHMMSS/pytorch_model.pth"
 WEIGHTS_PTH=""
 
-EXTRA_ARGS=""
-if [ -n "$WEIGHTS_PTH" ]; then
-    EXTRA_ARGS="--weights_pth $WEIGHTS_PTH"
-fi
+EXTRA=""
+[ -n "$WEIGHTS_PTH" ] && EXTRA="--weights_pth $WEIGHTS_PTH"
 
 python -m eval.final_math500 \
-    --model_path           "$MODEL" \
-    --parquet_path         "$VAL_PARQUET" \
-    --output_dir           "$OUTPUT_DIR" \
-    --tensor_parallel_size "$TP" \
-    --cuda_devices         "$DEVICES" \
-    --temperature          "$TEMPERATURE" \
-    --max_tokens           "$MAX_TOKENS" \
-    --n_samples            "$N_SAMPLES" \
-    $EXTRA_ARGS
+    --model_path           Qwen/Qwen2.5-Math-1.5B-Instruct \
+    --parquet_path         data/val/math500.parquet \
+    --output_dir           outputs/val_preds \
+    --tensor_parallel_size 4 \
+    --cuda_devices         0,1,2,3 \
+    --temperature          0.0 \
+    --max_tokens           3072 \
+    $EXTRA
