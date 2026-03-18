@@ -74,7 +74,7 @@ except ImportError:
             s.bind(("", 0))
             return s.getsockname()[1]
 
-from deepscaler import compute_training_score, SYSTEM_PROMPT
+from deepscaler import compute_training_score
 
 
 # ─────────────────────────────────────────────────────────────────────────────
