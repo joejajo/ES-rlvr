@@ -46,9 +46,11 @@ ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-200}"
-GLOBAL_SEED="${GLOBAL_SEED:-42}"
+GLOBAL_SEED="${GLOBAL_SEED:-}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
 SCRIPT="${BASE_DIR}/train/es_rlvr_train.py"
+SEED_ARG=""
+[[ -n "${GLOBAL_SEED}" ]] && SEED_ARG="--global_seed ${GLOBAL_SEED}"
 python "${SCRIPT}" \
   --model_name        "${MODEL_NAME}" \
   --parquet_path      "${TRAIN_PARQUET}" \
@@ -58,7 +60,7 @@ python "${SCRIPT}" \
   --num_engines       "${NUM_ENGINES}" \
   --num_iterations    "${NUM_ITERATIONS}" \
   --cuda_devices      0,1,2,3 \
-  --global_seed       "${GLOBAL_SEED}" \
+  ${SEED_ARG} \
   --experiment_dir    "${OUT_DIR}/es_experiment" \
   --output_every      "${OUTPUT_EVERY}" \
   --verbose
