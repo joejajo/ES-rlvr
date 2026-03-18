@@ -258,6 +258,7 @@ def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
         temperature=temperature,
         max_tokens=max_tokens,
         logprobs=20,         # top-20 for Shannon entropy approximation (vLLM max)
+        seed=42,             # fixed sampling seed, matches countdown_accl reference
     )
     handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
     return handle, time.time()
