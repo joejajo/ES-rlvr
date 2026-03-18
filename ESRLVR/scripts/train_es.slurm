@@ -22,5 +22,6 @@ python -m train.es_rlvr_train \
     --num_iterations   200 \
     --num_engines      4 \
     --cuda_devices     0,1,2,3 \
-    --val_every        20 \
+    --max_tokens       3084 \
+    --val_every        50 \
     --output_every     5

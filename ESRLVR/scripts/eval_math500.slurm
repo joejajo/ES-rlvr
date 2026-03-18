@@ -26,5 +26,5 @@ python -m eval.final_math500 \
     --tensor_parallel_size 4 \
     --cuda_devices         0,1,2,3 \
     --temperature          0.0 \
-    --max_tokens           3072 \
+    --max_tokens           3084 \
     $EXTRA

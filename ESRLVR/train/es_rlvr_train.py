@@ -75,6 +75,8 @@ def parse_args():
     p.add_argument("--num_iterations",   type=int,   default=NUM_ITERATIONS)
     p.add_argument("--cuda_devices",     type=str,   default="0,1,2,3")
     p.add_argument("--global_seed",      type=int,   default=None)
+    p.add_argument("--max_tokens",        type=int,   default=3084,
+                   help="Max generation tokens per sample during training.")
     p.add_argument("--output_every",     type=int,   default=1)
     p.add_argument("--val_every",        type=int,   default=0)
     p.add_argument("--verbose",          action="store_true")
@@ -166,7 +168,7 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 # Generation + reward
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=4032):
+def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=3084):
     handle = llm.generate.remote(
         [d["prompt_str"] for d in task_datas],
         SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20),
@@ -351,7 +353,7 @@ def main(args):
             try: seed = next(seed_iter)
             except StopIteration: break
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
-            h, ts = evaluate_handle(llm, train_data)
+            h, ts = evaluate_handle(llm, train_data, max_tokens=args.max_tokens)
             inflight[h] = {"engine": llm, "eng_idx": eng_idx, "seed": seed, "ts": ts}
 
         while inflight:
@@ -376,7 +378,7 @@ def main(args):
             ray.get(meta["engine"].collective_rpc.remote(
                 "perturb_self_weights", args=(next_seed, args.sigma, False)
             ))
-            h, ts = evaluate_handle(meta["engine"], train_data)
+            h, ts = evaluate_handle(meta["engine"], train_data, max_tokens=args.max_tokens)
             inflight[h] = {"engine": meta["engine"], "eng_idx": meta["eng_idx"],
                            "seed": next_seed, "ts": ts}
 

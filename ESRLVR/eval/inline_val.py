@@ -12,7 +12,7 @@ from reward.deepscaler import compute_training_score
 
 
 def run_inline_val(engine, val_task_datas, out_dir, run_tag, iteration,
-                   temperature=0.0, max_tokens=3072):
+                   temperature=0.0, max_tokens=3084):
     prompts = [d["prompt_str"] for d in val_task_datas]
     t0 = time.time()
     outputs = ray.get(engine.generate.remote(
