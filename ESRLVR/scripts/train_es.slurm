@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=12:00:00
-#SBATCH --output=/home/woody/iwi7/iwi7107h/Esrlvr/outputs/%x_%j.out
-#SBATCH --error=/home/woody/iwi7/iwi7107h/Esrlvr/outputs/%x_%j.err
+#SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.out
+#SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.err
 #SBATCH --export=NONE
 # =============================================================================
 #  ES-RLVR — 4-GPU SLURM script
@@ -23,7 +23,7 @@ set +u
 conda activate grpo
 set -u
 # ── Paths ───────────────────────────────────────────────────────────────────
-BASE_DIR="/home/woody/iwi7/iwi7107h/Esrlvr"
+BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVR"
 TRAIN_PARQUET="${BASE_DIR}/Dataset parquet/pi1_r128.parquet"
 OUT_DIR="${BASE_DIR}/outputs/results_${SLURM_JOB_ID}"
 mkdir -p "${OUT_DIR}"
@@ -48,7 +48,7 @@ NUM_ENGINES="${NUM_ENGINES:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-200}"
 GLOBAL_SEED="${GLOBAL_SEED:-42}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
-SCRIPT="${BASE_DIR}/ESRLVR/train/es_rlvr_train.py"
+SCRIPT="${BASE_DIR}/train/es_rlvr_train.py"
 python "${SCRIPT}" \
   --model_name        "${MODEL_NAME}" \
   --parquet_path      "${TRAIN_PARQUET}" \
