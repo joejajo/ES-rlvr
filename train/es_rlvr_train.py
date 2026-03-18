@@ -180,7 +180,7 @@ def launch_engines(num_engines: int, model_path: str):
             model=model_path,
             tensor_parallel_size=1,
             distributed_executor_backend="ray",
-            worker_extension_cls="train.worker_extn.WorkerExtension",
+            worker_extension_cls="worker_extn.WorkerExtension",
             dtype="float16",
             enable_prefix_caching=False,
             enforce_eager=False,
