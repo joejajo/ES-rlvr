@@ -24,7 +24,8 @@ conda activate grpo
 set -u
 # ── Paths ───────────────────────────────────────────────────────────────────
 BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVR"
-TRAIN_PARQUET="${BASE_DIR}/Dataset parquet/pi1_r128.parquet"
+TRAIN_PARQUET="${BASE_DIR}/data/train/pi1_r128.parquet"
+VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
 OUT_DIR="${BASE_DIR}/outputs/results_${SLURM_JOB_ID}"
 mkdir -p "${OUT_DIR}"
 # ── Environment variables ────────────────────────────────────────────────────
@@ -54,6 +55,7 @@ SEED_ARG=""
 python "${SCRIPT}" \
   --model_name        "${MODEL_NAME}" \
   --parquet_path      "${TRAIN_PARQUET}" \
+  --val_parquet_path  "${VAL_PARQUET}" \
   --sigma             "${SIGMA}" \
   --alpha             "${ALPHA}" \
   --population_size   "${POPULATION_SIZE}" \
