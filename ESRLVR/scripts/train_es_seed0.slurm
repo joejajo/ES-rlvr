@@ -26,8 +26,7 @@ set -u
 BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVR"
 TRAIN_PARQUET="${BASE_DIR}/data/train/pi1_r128.parquet"
 VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
-OUT_DIR="${BASE_DIR}/outputs/results_${SLURM_JOB_ID}"
-mkdir -p "${OUT_DIR}"
+cd "${BASE_DIR}"
 # ── Environment variables ────────────────────────────────────────────────────
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
@@ -62,5 +61,4 @@ python "${SCRIPT}" \
   --cuda_devices      0,1,2,3 \
   --output_every      "${OUTPUT_EVERY}" \
   --verbose
-echo "ES experiment dir: ${OUT_DIR}"
 echo "Job complete: ${SLURM_JOB_ID}"
