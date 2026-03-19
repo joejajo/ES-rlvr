@@ -9,7 +9,7 @@
 #SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.err
 #SBATCH --export=NONE
 # =============================================================================
-#  ES-RLVR — 4-GPU SLURM script (sampling seed=0, global_seed=None)
+#  ES-RLVR — 4-GPU SLURM script (no fixed sampling seed, global_seed=1234)
 #
 #  One-Shot-RLVR + vLLM + Ray + NCCL, 4 engines across 4 GPUs.
 # =============================================================================
@@ -48,7 +48,7 @@ NUM_ENGINES="${NUM_ENGINES:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-200}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"
 SCRIPT="${BASE_DIR}/train/es_rlvr_train_seed0.py"
-# global_seed intentionally not passed (defaults to None inside the script)
+# global_seed intentionally not passed (defaults to 1234 inside the script)
 python "${SCRIPT}" \
   --model_name        "${MODEL_NAME}" \
   --parquet_path      "${TRAIN_PARQUET}" \
