@@ -175,7 +175,7 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=3084):
     handle = llm.generate.remote(
         [d["prompt_str"] for d in task_datas],
-        SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20, seed=0),
+        SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20),
         use_tqdm=False,
     )
     return handle, time.time()
