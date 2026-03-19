@@ -101,7 +101,7 @@ def parse_args():
                              "'z_bonus' = z_r + entropy_coeff * z_h  (default).")
     parser.add_argument("--entropy_coeff",   type=float, default=0.05,
                         help="Weight of the entropy z-score in the fitness (z_bonus mode).")
-    parser.add_argument("--train_temperature", type=float, default=1.0,
+    parser.add_argument("--train_temperature", type=float, default=0.7,
                         help="Sampling temperature used during training generation.")
 
     args = parser.parse_args()
