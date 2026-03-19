@@ -78,7 +78,7 @@ def parse_args():
     p.add_argument("--num_engines",      type=int,   default=NUM_ENGINES)
     p.add_argument("--num_iterations",   type=int,   default=NUM_ITERATIONS)
     p.add_argument("--cuda_devices",     type=str,   default="0,1,2,3")
-    p.add_argument("--global_seed",      type=int,   default=1234)
+    p.add_argument("--global_seed",      type=int,   default=None)
     p.add_argument("--max_tokens",        type=int,   default=3084,
                    help="Max generation tokens per sample during training.")
     p.add_argument("--output_every",     type=int,   default=1)
@@ -175,7 +175,7 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=3084):
     handle = llm.generate.remote(
         [d["prompt_str"] for d in task_datas],
-        SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20),
+        SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20, seed=42),
         use_tqdm=False,
     )
     return handle, time.time()
