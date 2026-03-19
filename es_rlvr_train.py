@@ -113,7 +113,7 @@ def parse_args():
     parser.add_argument("--num_iterations", type=int, default=NUM_ITERATIONS)
     parser.add_argument("--experiment_dir", type=str, default=EXPERIMENT_DIR)
     parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
-    parser.add_argument("--global_seed", type=int, default=None)
+    parser.add_argument("--global_seed", type=int, default=1234)
     parser.add_argument("--output_every", type=int, default=1,
                         help="Print prompt+response sample every N training iterations (default: 1 = every iter).")
     parser.add_argument("--verbose", action="store_true")
@@ -253,7 +253,6 @@ def evaluate_handle(llm, task_datas: list, temperature: float = 0.7,
         temperature=temperature,
         max_tokens=max_tokens,
         logprobs=20,         # top-20 for Shannon entropy approximation (vLLM max)
-        seed=42,
     )
     handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
     return handle, time.time()
