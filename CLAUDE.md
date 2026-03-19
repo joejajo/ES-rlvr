@@ -9,8 +9,8 @@ This file provides guidance for AI assistants (e.g. Claude Code) working in this
 **Name:** ES-rlvr
 **Owner:** joejajo
 **Remote:** `http://local_proxy@127.0.0.1:41211/git/joejajo/ES-rlvr`
-
-This repository appears to be in its initial state (no committed source code yet). Update this file once the project structure is established.
+**Primary branch:** `claude/claude-md-mmjmsyal1uqqzz0l-l304z`
+**Primary source directory:** `ESRLVR/` — all source code lives here; always read/write within this subdirectory unless explicitly told otherwise.
 
 ---
 
