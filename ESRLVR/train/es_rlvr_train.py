@@ -78,7 +78,7 @@ def parse_args():
     p.add_argument("--max_tokens",        type=int,   default=3084,
                    help="Max generation tokens per sample during training.")
     p.add_argument("--output_every",     type=int,   default=1)
-    p.add_argument("--val_every",        type=int,   default=0)
+    p.add_argument("--val_every",        type=int,   default=50)
     p.add_argument("--verbose",          action="store_true")
     args = p.parse_args()
 
