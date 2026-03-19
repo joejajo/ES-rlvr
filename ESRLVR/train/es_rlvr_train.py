@@ -7,6 +7,10 @@ import argparse
 import gc
 import json
 import os
+
+# Prevent HuggingFace from trying to reach the internet (compute nodes are firewalled)
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import random
 import re
 import shutil
