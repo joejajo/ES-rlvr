@@ -25,8 +25,7 @@ BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVR"
 MODEL_NAME="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B"
 TRAIN_PARQUET="${BASE_DIR}/data/train/pi1_r128.parquet"
 VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
-OUT_DIR="${BASE_DIR}/outputs/smoke_${SLURM_JOB_ID}"
-mkdir -p "${OUT_DIR}"
+cd "${BASE_DIR}"
 # ── Environment variables ─────────────────────────────────────────────────────
 export PYTHONPATH="${BASE_DIR}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -50,6 +49,5 @@ python "${BASE_DIR}/train/es_rlvr_train.py" \
   --num_iterations    3 \
   --val_every         0 \
   --output_every      1 \
-  --experiment_dir    "${OUT_DIR}/es_experiment" \
   --verbose
-echo "Smoke test complete: ${OUT_DIR}/es_experiment"
+echo "Smoke test complete."
