@@ -79,10 +79,12 @@ def parse_args():
     p.add_argument("--num_iterations",   type=int,   default=NUM_ITERATIONS)
     p.add_argument("--cuda_devices",     type=str,   default="0,1,2,3")
     p.add_argument("--global_seed",      type=int,   default=None)
-    p.add_argument("--max_tokens",        type=int,   default=3084,
+    p.add_argument("--max_tokens",        type=int,   default=4096,
                    help="Max generation tokens per sample during training.")
     p.add_argument("--output_every",     type=int,   default=1)
     p.add_argument("--val_every",        type=int,   default=50)
+    p.add_argument("--save_every",       type=int,   default=50,
+                   help="Save model outputs to JSONL every N iterations.")
     p.add_argument("--verbose",          action="store_true")
     args = p.parse_args()
 
@@ -172,7 +174,7 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 # Generation + reward
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=3084):
+def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=4096):
     handle = llm.generate.remote(
         [d["prompt_str"] for d in task_datas],
         SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20),
@@ -401,10 +403,11 @@ def main(args):
         writer.add_scalar("reward/std",     std_r,  i)
         writer.add_scalar("reward/entropy", mean_e, i)
 
-        with open(train_jsonl, "a", encoding="utf-8") as f:
-            for s, v in seeds_perf.items():
-                for sample in v.get("samples", []):
-                    f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
+        if i % args.save_every == 0:
+            with open(train_jsonl, "a", encoding="utf-8") as f:
+                for s, v in seeds_perf.items():
+                    for sample in v.get("samples", []):
+                        f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
 
         # ES update on engine 0 then broadcast
         ray.get([
