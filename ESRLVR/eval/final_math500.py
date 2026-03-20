@@ -127,7 +127,9 @@ def main():
     outputs = llm.generate(
         [d["prompt_str"] for d in task_datas],
         SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens,
-                       n=args.n_samples, stop=["<|im_end|>", "<|im_start|>"]),
+                       n=args.n_samples, seed=0,
+                       stop=["</s>", "<|im_end|>", "<|endoftext|>"],
+                       stop_token_ids=[151645, 151643]),
     )
     elapsed = time.time() - t0
     print(f"[EVAL] Done in {elapsed:.1f}s")
