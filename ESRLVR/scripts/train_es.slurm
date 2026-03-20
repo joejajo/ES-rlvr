@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:a100:4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.out
 #SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.err
 #SBATCH --export=NONE
@@ -46,7 +46,7 @@ SIGMA="${SIGMA:-0.001}"
 ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-4}"
-NUM_ITERATIONS="${NUM_ITERATIONS:-200}"
+NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
 GLOBAL_SEED="${GLOBAL_SEED:-}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
 SCRIPT="${BASE_DIR}/train/es_rlvr_train.py"

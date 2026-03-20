@@ -58,9 +58,9 @@ from reward.deepscaler import compute_training_score
 
 SIGMA           = 0.001
 ALPHA           = 0.0005
-POPULATION_SIZE = 20
+POPULATION_SIZE = 30
 NUM_ENGINES     = 4
-NUM_ITERATIONS  = 200
+NUM_ITERATIONS  = 1000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,10 +174,10 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 # Generation + reward
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=4096):
+def evaluate_handle(llm, task_datas, temperature=0.0, max_tokens=4096):
     handle = llm.generate.remote(
         [d["prompt_str"] for d in task_datas],
-        SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20),
+        SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20, seed=42),
         use_tqdm=False,
     )
     return handle, time.time()
@@ -339,6 +339,7 @@ def main(args):
     print(f"  Pop/σ/α   : {args.population_size} / {args.sigma} / {args.alpha}")
     print(f"  Engines   : {args.num_engines}   Iters: {args.num_iterations}")
     print(f"  Train     : {len(train_data)} ex   Val: {len(val_data)} ex")
+    print(f"  global_seed: {args.global_seed}  sampling_seed: 42")
     print("=" * 70 + "\n")
 
     train_jsonl = os.path.join(train_preds, f"train_{run_tag}.jsonl")
