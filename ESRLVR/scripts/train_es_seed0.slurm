@@ -28,6 +28,7 @@ TRAIN_PARQUET="${BASE_DIR}/data/train/pi1_r128.parquet"
 VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
 cd "${BASE_DIR}"
 # ── Environment variables ────────────────────────────────────────────────────
+export PYTHONPATH="${BASE_DIR}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export TF_ENABLE_ONEDNN_OPTS=0

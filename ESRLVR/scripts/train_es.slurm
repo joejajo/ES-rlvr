@@ -29,6 +29,7 @@ VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
 OUT_DIR="${BASE_DIR}/outputs/results_${SLURM_JOB_ID}"
 mkdir -p "${OUT_DIR}"
 # ── Environment variables ────────────────────────────────────────────────────
+export PYTHONPATH="${BASE_DIR}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export TF_ENABLE_ONEDNN_OPTS=0

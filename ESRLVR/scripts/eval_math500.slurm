@@ -24,6 +24,7 @@ MODEL_NAME="${MODEL_NAME:-/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B}"
 # Set WEIGHTS_PTH to evaluate a trained checkpoint; leave empty for base model.
 # WEIGHTS_PTH="${BASE_DIR}/outputs/results_<JOB_ID>/es_experiment/model_saves/final_model_iter200/pytorch_model.pth"
 WEIGHTS_PTH="${WEIGHTS_PTH:-}"
+export PYTHONPATH="${BASE_DIR}:${PYTHONPATH:-}"
 EXTRA=""
 [ -n "${WEIGHTS_PTH}" ] && EXTRA="--weights_pth ${WEIGHTS_PTH}"
 python -m eval.final_math500 \
