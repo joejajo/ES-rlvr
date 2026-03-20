@@ -427,6 +427,7 @@ def main(args):
             val_acc = run_inline_val(
                 engines[0], val_data,
                 out_dir=val_preds, run_tag=run_tag, iteration=i,
+                max_tokens=args.max_tokens,
             )
             writer.add_scalar("val/math500_acc", val_acc, i)
 
