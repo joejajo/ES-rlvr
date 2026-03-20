@@ -48,7 +48,10 @@ POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-200}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"
+RESUME_FROM="${RESUME_FROM:-}"      # path to checkpoint dir; empty = fresh run
 SCRIPT="${BASE_DIR}/train/es_rlvr_train_seed42.py"
+RESUME_ARG=""
+[[ -n "${RESUME_FROM}" ]] && RESUME_ARG="--resume_from ${RESUME_FROM}"
 # global_seed=42 and sampling_seed=42 are hardcoded in the script
 python "${SCRIPT}" \
   --model_name        "${MODEL_NAME}" \
@@ -60,6 +63,7 @@ python "${SCRIPT}" \
   --num_engines       "${NUM_ENGINES}" \
   --num_iterations    "${NUM_ITERATIONS}" \
   --cuda_devices      0,1,2,3 \
+  ${RESUME_ARG} \
   --output_every      "${OUTPUT_EVERY}" \
   --verbose
 echo "Job complete: ${SLURM_JOB_ID}"

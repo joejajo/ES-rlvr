@@ -49,9 +49,12 @@ NUM_ENGINES="${NUM_ENGINES:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
 GLOBAL_SEED="${GLOBAL_SEED:-}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
+RESUME_FROM="${RESUME_FROM:-}"      # path to checkpoint dir; empty = fresh run
 SCRIPT="${BASE_DIR}/train/es_rlvr_train.py"
 SEED_ARG=""
 [[ -n "${GLOBAL_SEED}" ]] && SEED_ARG="--global_seed ${GLOBAL_SEED}"
+RESUME_ARG=""
+[[ -n "${RESUME_FROM}" ]] && RESUME_ARG="--resume_from ${RESUME_FROM}"
 python "${SCRIPT}" \
   --model_name        "${MODEL_NAME}" \
   --parquet_path      "${TRAIN_PARQUET}" \
@@ -63,6 +66,7 @@ python "${SCRIPT}" \
   --num_iterations    "${NUM_ITERATIONS}" \
   --cuda_devices      0,1,2,3 \
   ${SEED_ARG} \
+  ${RESUME_ARG} \
   --output_every      "${OUTPUT_EVERY}" \
   --verbose
 echo "Job complete: ${SLURM_JOB_ID}"
