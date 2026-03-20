@@ -87,6 +87,9 @@ def parse_args():
     p.add_argument("--save_every",       type=int,   default=50,
                    help="Save model outputs to JSONL every N iterations.")
     p.add_argument("--verbose",          action="store_true")
+    p.add_argument("--resume_from",      type=str,   default=None,
+                   help="Path to checkpoint dir to resume from "
+                        "(must contain pytorch_model.pth + resume_state.json).")
     args = p.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
@@ -276,6 +279,17 @@ def main(args):
         os.makedirs(d, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
 
+    # Resume state
+    start_iter = 0
+    if args.resume_from:
+        state_file = os.path.join(args.resume_from, "resume_state.json")
+        if not os.path.exists(state_file):
+            raise FileNotFoundError(f"[RESUME] resume_state.json not found in {args.resume_from}")
+        with open(state_file) as f:
+            resume_state = json.load(f)
+        start_iter = resume_state["last_iter"] + 1
+        print(f"[RESUME] Resuming from iter {start_iter}  (checkpoint: {args.resume_from})")
+
     # Base model snapshot
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
@@ -323,6 +337,15 @@ def main(args):
     ])
     print("[NCCL] Ready.\n")
 
+    if args.resume_from:
+        ckpt_weights = os.path.join(args.resume_from, "pytorch_model.pth")
+        if not os.path.exists(ckpt_weights):
+            raise FileNotFoundError(f"[RESUME] pytorch_model.pth not found in {args.resume_from}")
+        print(f"[RESUME] Loading weights from {ckpt_weights} ...")
+        ray.get(engines[0].collective_rpc.remote("load_weights_from_disk", args=(ckpt_weights,)))
+        ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
+        print("[RESUME] Weights loaded and broadcast to all engines.\n")
+
     def cleanup():
         for llm in engines:
             try: ray.kill(llm)
@@ -346,7 +369,7 @@ def main(args):
     train_jsonl = os.path.join(train_preds, f"train_{run_tag}.jsonl")
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    for i in range(args.num_iterations):
+    for i in range(start_iter, args.num_iterations):
         print(f"{'─'*50}  iter {i}/{args.num_iterations-1}")
         t0 = time.time()
 
@@ -410,6 +433,14 @@ def main(args):
                 for s, v in seeds_perf.items():
                     for sample in v.get("samples", []):
                         f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
+
+            iter_ckpt = os.path.join("checkpoints", f"iter{i}_{run_tag}")
+            os.makedirs(iter_ckpt, exist_ok=True)
+            ckpt_pth = os.path.join(iter_ckpt, "pytorch_model.pth")
+            ray.get(engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(ckpt_pth,)))
+            with open(os.path.join(iter_ckpt, "resume_state.json"), "w") as f:
+                json.dump({"last_iter": i, "run_tag": run_tag}, f, indent=2)
+            print(f"[CKPT] Saved checkpoint → {iter_ckpt}")
 
         # ES update on engine 0 then broadcast
         ray.get([
