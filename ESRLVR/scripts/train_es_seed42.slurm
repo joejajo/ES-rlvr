@@ -47,6 +47,7 @@ ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-200}"
+N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-4}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"
 RESUME_FROM="${RESUME_FROM:-}"      # path to checkpoint dir; empty = fresh run
 SCRIPT="${BASE_DIR}/train/es_rlvr_train_seed42.py"
@@ -64,6 +65,7 @@ python "${SCRIPT}" \
   --num_iterations    "${NUM_ITERATIONS}" \
   --cuda_devices      0,1,2,3 \
   ${RESUME_ARG} \
+  --n_rollouts_per_prompt "${N_ROLLOUTS_PER_PROMPT}" \
   --output_every      "${OUTPUT_EVERY}" \
   --verbose
 echo "Job complete: ${SLURM_JOB_ID}"
