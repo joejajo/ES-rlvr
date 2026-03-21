@@ -200,28 +200,32 @@ def _extract_boxed(text: str):
 
 
 def _compute_token_entropy(output_obj) -> tuple:
-    completion = output_obj.outputs[0]
-    if not getattr(completion, "logprobs", None):
-        return 0.0, 0.0
-    token_entropies, coverages = [], []
-    for lp_dict in completion.logprobs:
-        if not lp_dict:
+    all_ents, all_covs = [], []
+    for completion in output_obj.outputs:
+        if not getattr(completion, "logprobs", None):
             continue
-        log_probs = np.array(
-            [lp.logprob if hasattr(lp, "logprob") else float(lp)
-             for lp in lp_dict.values()],
-            dtype=np.float64,
-        )
-        probs   = np.exp(log_probs)
-        covered = float(min(max(np.sum(probs), 0.0), 1.0))
-        tail    = max(0.0, 1.0 - covered)
-        h       = float(-np.sum(probs * log_probs))
-        if tail > 1e-9:
-            h += float(-tail * np.log(tail))
-        token_entropies.append(h)
-        coverages.append(covered)
-    return (float(np.mean(token_entropies)) if token_entropies else 0.0,
-            float(np.mean(coverages))       if coverages       else 0.0)
+        token_entropies, coverages = [], []
+        for lp_dict in completion.logprobs:
+            if not lp_dict:
+                continue
+            log_probs = np.array(
+                [lp.logprob if hasattr(lp, "logprob") else float(lp)
+                 for lp in lp_dict.values()],
+                dtype=np.float64,
+            )
+            probs   = np.exp(log_probs)
+            covered = float(min(max(np.sum(probs), 0.0), 1.0))
+            tail    = max(0.0, 1.0 - covered)
+            h       = float(-np.sum(probs * log_probs))
+            if tail > 1e-9:
+                h += float(-tail * np.log(tail))
+            token_entropies.append(h)
+            coverages.append(covered)
+        if token_entropies:
+            all_ents.append(float(np.mean(token_entropies)))
+            all_covs.append(float(np.mean(coverages)))
+    return (float(np.mean(all_ents)) if all_ents else 0.0,
+            float(np.mean(all_covs)) if all_covs else 0.0)
 
 
 def _postprocess_outputs(outputs, task_datas, debug_print=False):
