@@ -3,20 +3,57 @@
 import json
 import os
 import time
+from typing import Optional
 
 import numpy as np
 import ray
 from vllm import SamplingParams
 
 from reward.deepscaler import compute_training_score
+from reward.reward_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
+
+
+def _score_reason(completion: str, ground_truth: str) -> dict:
+    """Diagnose why a sample got its score. Does not change official score logic."""
+    extracted_answer = extract_answer(completion)
+    boxed_found = "\\boxed" in completion
+
+    gt = str(ground_truth)
+    gt_for_compare = extract_answer(gt) if "\\boxed" in gt else gt
+    if gt_for_compare is None:
+        gt_for_compare = gt
+
+    if extracted_answer is None:
+        return {
+            "boxed_found": boxed_found,
+            "parse_ok": False,
+            "extracted_answer": None,
+            "score_reason": "no_box_or_parse_fail",
+        }
+
+    is_correct = bool(
+        grade_answer_mathd(extracted_answer, gt_for_compare)
+        or grade_answer_sympy(extracted_answer, gt_for_compare)
+    )
+    return {
+        "boxed_found": boxed_found,
+        "parse_ok": True,
+        "extracted_answer": extracted_answer,
+        "score_reason": "correct" if is_correct else "mismatch",
+    }
 
 
 def run_inline_val(engine, val_task_datas, out_dir, run_tag, iteration,
-                   temperature=0.0, max_tokens=4096):
+                   temperature=0.6, max_tokens=4096, sampling_seed: Optional[int] = None):
     prompts = [d["prompt_str"] for d in val_task_datas]
+
+    sampling_kwargs = dict(temperature=temperature, max_tokens=max_tokens)
+    if sampling_seed is not None:
+        sampling_kwargs["seed"] = sampling_seed
+
     t0 = time.time()
     outputs = ray.get(engine.generate.remote(
-        prompts, SamplingParams(temperature=temperature, max_tokens=max_tokens), use_tqdm=False
+        prompts, SamplingParams(**sampling_kwargs), use_tqdm=False
     ))
     elapsed = time.time() - t0
 
@@ -25,12 +62,15 @@ def run_inline_val(engine, val_task_datas, out_dir, run_tag, iteration,
         completion = output.outputs[0].text
         score = compute_training_score(completion, data["ground_truth"])
         scores.append(score)
+        diag = _score_reason(completion, data["ground_truth"])
         records.append({
             "iter": iteration, "idx": idx,
             "question":       data.get("question", ""),
             "ground_truth":   data["ground_truth"],
             "model_response": completion,
             "score":          score,
+            "response_len":   len(completion),
+            **diag,
         })
 
     accuracy = float(np.mean(scores)) if scores else 0.0
@@ -40,6 +80,14 @@ def run_inline_val(engine, val_task_datas, out_dir, run_tag, iteration,
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    print(f"[VAL] iter={iteration}  acc={accuracy*100:.2f}%  "
-          f"({int(round(sum(scores)))}/{len(scores)})  {elapsed:.1f}s  → {out_path}")
+    num_correct  = int(round(sum(scores)))
+    num_parse_ok = sum(int(r["parse_ok"]) for r in records)
+    num_boxed    = sum(int(r["boxed_found"]) for r in records)
+    print(
+        f"[VAL] iter={iteration}  acc={accuracy*100:.2f}%"
+        f"  ({num_correct}/{len(scores)})"
+        f"  parse_ok={num_parse_ok}/{len(records)}"
+        f"  boxed={num_boxed}/{len(records)}"
+        f"  T={temperature}  {elapsed:.1f}s  → {out_path}"
+    )
     return accuracy

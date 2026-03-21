@@ -83,6 +83,12 @@ def parse_args():
                    help="Max generation tokens per sample during training.")
     p.add_argument("--output_every",     type=int,   default=1)
     p.add_argument("--val_every",        type=int,   default=50)
+    p.add_argument("--val_before_train", action="store_true",
+                   help="Run inline validation once before ES training starts.")
+    p.add_argument("--val_temperature", type=float, default=0.6,
+                   help="Sampling temperature for inline validation.")
+    p.add_argument("--val_sampling_seed", type=int, default=None,
+                   help="Optional fixed seed for inline validation (reproducible results).")
     p.add_argument("--save_every",       type=int,   default=50,
                    help="Save model outputs to JSONL every N iterations.")
     p.add_argument("--verbose",          action="store_true")
@@ -367,6 +373,18 @@ def main(args):
 
     train_jsonl = os.path.join(train_preds, f"train_{run_tag}.jsonl")
 
+    # ── Pre-train validation ───────────────────────────────────────────────────
+    if args.val_before_train and val_data:
+        from eval.inline_val import run_inline_val
+        pre_val_acc = run_inline_val(
+            engines[0], val_data,
+            out_dir=val_preds, run_tag=run_tag, iteration=-1,
+            temperature=args.val_temperature,
+            max_tokens=args.max_tokens,
+            sampling_seed=args.val_sampling_seed,
+        )
+        writer.add_scalar("val_before_train/math500_acc", pre_val_acc, 0)
+
     # ── Training loop ─────────────────────────────────────────────────────────
     for i in range(start_iter, args.num_iterations):
         print(f"{'─'*50}  iter {i}/{args.num_iterations-1}")
@@ -457,7 +475,9 @@ def main(args):
             val_acc = run_inline_val(
                 engines[0], val_data,
                 out_dir=val_preds, run_tag=run_tag, iteration=i,
+                temperature=args.val_temperature,
                 max_tokens=args.max_tokens,
+                sampling_seed=args.val_sampling_seed,
             )
             writer.add_scalar("val/math500_acc", val_acc, i)
 
