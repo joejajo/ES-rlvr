@@ -86,6 +86,8 @@ def parse_args():
     p.add_argument("--val_every",        type=int,   default=50)
     p.add_argument("--save_every",       type=int,   default=50,
                    help="Save model outputs to JSONL every N iterations.")
+    p.add_argument("--n_rollouts_per_prompt", type=int, default=4,
+                   help="Completions per prompt per perturbation (K rollouts). Default=4.")
     p.add_argument("--verbose",          action="store_true")
     p.add_argument("--resume_from",      type=str,   default=None,
                    help="Path to checkpoint dir to resume from "
@@ -178,10 +180,15 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
 # Generation + reward
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=4096):
+def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=4096, n_rollouts_per_prompt=1):
     handle = llm.generate.remote(
         [d["prompt_str"] for d in task_datas],
-        SamplingParams(temperature=temperature, max_tokens=max_tokens, logprobs=20),
+        SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            logprobs=20,
+            n=n_rollouts_per_prompt,
+        ),
         use_tqdm=False,
     )
     return handle, time.time()
@@ -221,31 +228,41 @@ def _postprocess_outputs(outputs, task_datas, debug_print=False):
     scores, entropies, coverages, samples = [], [], [], []
 
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
-        completion    = output.outputs[0].text
-        binary_reward = compute_training_score(completion, data["ground_truth"])
+        rollout_texts   = [o.text for o in output.outputs]
+        rollout_rewards = [
+            compute_training_score(text, data["ground_truth"])
+            for text in rollout_texts
+        ]
+        prompt_reward = float(np.mean(rollout_rewards)) if rollout_rewards else 0.0
         ent, cov      = _compute_token_entropy(output)
 
-        scores.append(binary_reward)
+        scores.append(prompt_reward)
         entropies.append(ent)
         coverages.append(cov)
+
+        primary_text = rollout_texts[0] if rollout_texts else ""
         samples.append({
-            "sample_idx":       idx,
-            "question":         data.get("question", ""),
-            "model_response":   completion,
-            "extracted_answer": _extract_boxed(completion) or "",
-            "ground_truth":     data.get("ground_truth", ""),
-            "binary_reward":    binary_reward,
-            "entropy":          ent,
-            "entropy_coverage": cov,
+            "sample_idx":            idx,
+            "question":              data.get("question", ""),
+            "model_response":        primary_text,
+            "all_model_responses":   rollout_texts,
+            "extracted_answer":      _extract_boxed(primary_text) or "",
+            "all_extracted_answers": [_extract_boxed(t) or "" for t in rollout_texts],
+            "ground_truth":          data.get("ground_truth", ""),
+            "binary_reward":         prompt_reward,
+            "all_binary_rewards":    rollout_rewards,
+            "entropy":               ent,
+            "entropy_coverage":      cov,
         })
 
         if debug_print and idx == 0:
-            tag     = "CORRECT" if binary_reward == 1.0 else "WRONG"
-            display = completion[:2000] + ("\n  ...[truncated]" if len(completion) > 2000 else "")
+            tag     = "CORRECT" if prompt_reward == 1.0 else ("PARTIAL" if prompt_reward > 0.0 else "WRONG")
+            display = primary_text[:2000] + ("\n  ...[truncated]" if len(primary_text) > 2000 else "")
             print("\n" + "=" * 70)
             print(f"  Q   : {data.get('question', '')}")
             print(f"  GT  : {data['ground_truth']}")
-            print(f"  Ans : {_extract_boxed(completion) or '(none)'}  [{tag}]")
+            print(f"  Ans : {_extract_boxed(primary_text) or '(none)'}  [{tag}]  "
+                  f"(mean_reward={prompt_reward:.3f} over {len(rollout_texts)} rollouts)")
             print(f"  Ent : {ent:.4f}  cov={cov:.4f}")
             print("─" * 70)
             for line in display.splitlines():
@@ -384,7 +401,8 @@ def main(args):
             try: seed = next(seed_iter)
             except StopIteration: break
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
-            h, ts = evaluate_handle(llm, train_data, max_tokens=args.max_tokens)
+            h, ts = evaluate_handle(llm, train_data, max_tokens=args.max_tokens,
+                                    n_rollouts_per_prompt=args.n_rollouts_per_prompt)
             inflight[h] = {"engine": llm, "eng_idx": eng_idx, "seed": seed, "ts": ts}
 
         while inflight:
@@ -409,7 +427,8 @@ def main(args):
             ray.get(meta["engine"].collective_rpc.remote(
                 "perturb_self_weights", args=(next_seed, args.sigma, False)
             ))
-            h, ts = evaluate_handle(meta["engine"], train_data, max_tokens=args.max_tokens)
+            h, ts = evaluate_handle(meta["engine"], train_data, max_tokens=args.max_tokens,
+                                    n_rollouts_per_prompt=args.n_rollouts_per_prompt)
             inflight[h] = {"engine": meta["engine"], "eng_idx": meta["eng_idx"],
                            "seed": next_seed, "ts": ts}
 
