@@ -17,7 +17,6 @@ Usage:
 import argparse
 import json
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -42,7 +41,6 @@ def parse_args():
     p.add_argument("--n_samples",            type=int,   default=1)
     p.add_argument("--tensor_parallel_size", type=int,   default=1)
     p.add_argument("--cuda_devices",         type=str,   default="0")
-    p.add_argument("--show_n",               type=int,   default=3)
     return p.parse_args()
 
 
@@ -72,25 +70,28 @@ def load_val_task_datas(parquet_path, tokenizer):
     return task_datas
 
 
-def _truncate_after_first_boxed(text):
+def _extract_last_boxed(text):
+    """Return the content of the last \\boxed{} in text, or None if absent."""
     s = text or ""
-    start = s.find(r"\boxed")
-    if start == -1:
-        return s
-    i = start + len(r"\boxed")
-    while i < len(s) and s[i].isspace():
+    parts = s.split(r"\boxed")
+    if len(parts) < 2:
+        return None
+    last = parts[-1]
+    i = 0
+    while i < len(last) and last[i].isspace():
         i += 1
-    if i >= len(s) or s[i] != "{":
-        return s
+    if i >= len(last) or last[i] != "{":
+        return None
     depth, end = 0, None
-    for j in range(i, len(s)):
-        if s[j] == "{": depth += 1
-        elif s[j] == "}":
+    for j in range(i, len(last)):
+        if last[j] == "{":
+            depth += 1
+        elif last[j] == "}":
             depth -= 1
             if depth == 0:
                 end = j
                 break
-    return s[:end + 1] if end is not None else s
+    return last[i + 1:end] if end is not None else None
 
 
 def prepare_model_dir(model_path, weights_pth, tmp_root):
@@ -137,23 +138,18 @@ def main():
     results, total_correct = [], 0.0
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
         gt     = data["ground_truth"]
-        scores = [compute_training_score(_truncate_after_first_boxed(o.text), gt)
-                  for o in output.outputs]
+        scores = [compute_training_score(o.text, gt) for o in output.outputs]
         avg    = sum(scores) / len(scores)
         total_correct += avg
 
-        first = _truncate_after_first_boxed(output.outputs[0].text)
-        m = re.search(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}", first)
-        extracted = m.group(1).strip() if m else None
+        extracted = _extract_last_boxed(output.outputs[0].text)
         tag = "CORRECT" if avg >= 1.0 else ("PARTIAL" if avg > 0 else "WRONG")
 
-        if idx < args.show_n:
-            print(f"\n{'='*70}\n[{idx+1}/{len(task_datas)}] {tag}")
-            print(f"Q: {data['question'][:200]}\nGT: {gt}  |  Ans: {extracted}")
-            print(first[:600])
-        else:
-            print(f"[{idx+1:3d}/{len(task_datas)}] {tag}  gt={gt!r}  pred={extracted!r}"
-                  + (f"  avg@{args.n_samples}={avg:.2f}" if args.n_samples > 1 else ""))
+        print(f"\n{'='*70}\n[{idx+1}/{len(task_datas)}] {tag}")
+        print(f"Q: {data['question'][:200]}\nGT: {gt}  |  Ans: {extracted}")
+        print(output.outputs[0].text)
+        if args.n_samples > 1:
+            print(f"avg@{args.n_samples}={avg:.2f}")
 
         results.append({
             "idx": idx, "question": data["question"], "ground_truth": gt,

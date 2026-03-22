@@ -47,6 +47,7 @@ ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
+N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-4}"
 GLOBAL_SEED="${GLOBAL_SEED:-}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
 RESUME_FROM="${RESUME_FROM:-}"      # path to checkpoint dir; empty = fresh run
@@ -67,6 +68,7 @@ python "${SCRIPT}" \
   --cuda_devices      0,1,2,3 \
   ${SEED_ARG} \
   ${RESUME_ARG} \
+  --n_rollouts_per_prompt "${N_ROLLOUTS_PER_PROMPT}" \
   --output_every      "${OUTPUT_EVERY}" \
   --verbose
 echo "Job complete: ${SLURM_JOB_ID}"
