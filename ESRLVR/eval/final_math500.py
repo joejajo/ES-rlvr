@@ -155,6 +155,7 @@ def main():
             "idx": idx, "question": data["question"], "ground_truth": gt,
             "extracted_answer": extracted, "avg_score": avg,
             "sample_scores": scores, "data_source": data["data_source"],
+            "model_responses": [o.text for o in output.outputs],
         })
 
     accuracy  = total_correct / len(task_datas) if task_datas else 0.0
