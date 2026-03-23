@@ -165,6 +165,11 @@ def main():
             "relaxed_score":            avg_relaxed,
             "sample_strict_scores":     sample_strict_scores,
             "sample_relaxed_scores":    sample_relaxed_scores,
+            # Backward-compatible aliases — point to strict values so that
+            # any downstream code reading the old field names still works.
+            "avg_score":                avg_strict,
+            "extracted_answer":         strict_extracted,
+            "sample_scores":            sample_strict_scores,
             "data_source":              data["data_source"],
             "model_responses":          [o.text for o in output.outputs],
         })

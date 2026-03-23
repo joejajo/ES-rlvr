@@ -40,11 +40,19 @@ from reward.reward_utils import (
 def _unwrap_box(boxed_str: Optional[str]) -> Optional[str]:
     """Strip the outer ``\\boxed{...}`` or ``\\fbox{...}`` wrapper.
 
+    Handles optional whitespace between the command and its opening brace,
+    e.g. ``\\fbox {42}`` as well as the standard ``\\fbox{42}``.
+    For nested content such as ``\\boxed{\\frac{1}{2}}``, only the outermost
+    ``\\boxed{`` and closing ``}`` are stripped — inner braces are preserved
+    correctly because ``last_boxed_only_string`` already matched the full
+    brace-balanced span.
+
     Parameters
     ----------
     boxed_str:
-        A string of the form ``\\boxed{content}`` or ``\\fbox{content}`` as
-        returned by ``last_boxed_only_string``, or ``None``.
+        A string of the form ``\\boxed{content}`` or ``\\fbox{content}`` (with
+        optional whitespace before ``{``) as returned by
+        ``last_boxed_only_string``, or ``None``.
 
     Returns
     -------
@@ -52,10 +60,15 @@ def _unwrap_box(boxed_str: Optional[str]) -> Optional[str]:
     """
     if boxed_str is None:
         return None
-    for prefix in (r"\boxed{", r"\fbox{"):
-        if boxed_str.startswith(prefix) and boxed_str.endswith("}"):
-            return boxed_str[len(prefix):-1]
-    return None
+    # Identify the command name (everything before the first '{', stripped).
+    brace_pos = boxed_str.find("{")
+    if brace_pos == -1 or not boxed_str.endswith("}"):
+        return None
+    command = boxed_str[:brace_pos].rstrip()
+    if command not in (r"\boxed", r"\fbox"):
+        return None
+    # Content sits between the opening '{' and the final '}'.
+    return boxed_str[brace_pos + 1:-1]
 
 
 def _unwrap_ground_truth(gt: str) -> str:
@@ -109,13 +122,16 @@ def extract_final_answer_strict(text: str) -> Optional[str]:
 
 
 # Plain-text fallback patterns tried in order when strict extraction fails.
+# All line-anchored patterns use (?:^|\n) so they only match at the start of a
+# line, preventing spurious matches on mid-sentence phrases like
+# "the answer is: we need to compute ...".
 _RELAXED_PATTERNS: list[tuple[str, re.Pattern]] = [
-    # GSM8K delimiter  #### 42
-    ("hash4",         re.compile(r"####\s*(.+?)(?:\n|$)")),
-    # "Final answer: ..."  or  "Final Answer - ..."
-    ("final_answer",  re.compile(r"[Ff]inal\s+[Aa]nswer\s*[:\-]\s*(.+?)(?:\n|$)")),
-    # "Answer: ..."  or  "Answer - ..."
-    ("answer_colon",  re.compile(r"\b[Aa]nswer\s*[:\-]\s*(.+?)(?:\n|$)")),
+    # GSM8K delimiter  #### 42  (may appear mid-line, safe because #### is distinctive)
+    ("hash4",        re.compile(r"####\s*(.+?)(?:\n|$)")),
+    # "Final answer: ..."  or  "Final Answer - ..."  — must start a line
+    ("final_answer", re.compile(r"(?:^|\n)[^\S\n]*[Ff]inal\s+[Aa]nswer\s*[:\-]\s*(.+?)(?:\n|$)")),
+    # "Answer: ..."  — must start a line to avoid mid-sentence false positives
+    ("answer_colon", re.compile(r"(?:^|\n)[^\S\n]*[Aa]nswer\s*[:\-]\s*(.+?)(?:\n|$)")),
 ]
 
 
