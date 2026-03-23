@@ -12,6 +12,11 @@ Usage:
 
     # avg@8 sampling
     python -m eval.final_math500 --n_samples 8 --temperature 0.7 --cuda_devices 0
+
+Scores
+------
+strict_score  — official / thesis number: answer must appear in \\boxed{} or \\fbox{}.
+relaxed_score — diagnostic only: also accepts plain-text "Answer: ..." patterns.
 """
 
 import argparse
@@ -27,7 +32,13 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 
-from reward.deepscaler import SYSTEM_PROMPT, compute_training_score
+# SYSTEM_PROMPT only — no training reward logic imported.
+from reward.deepscaler import SYSTEM_PROMPT
+from eval.math500_grader import (
+    compute_math500_eval_score,
+    extract_final_answer_relaxed,
+    extract_final_answer_strict,
+)
 
 
 def parse_args():
@@ -68,30 +79,6 @@ def load_val_task_datas(parquet_path, tokenizer):
             "question":     question,
         })
     return task_datas
-
-
-def _extract_last_boxed(text):
-    """Return the content of the last \\boxed{} in text, or None if absent."""
-    s = text or ""
-    parts = s.split(r"\boxed")
-    if len(parts) < 2:
-        return None
-    last = parts[-1]
-    i = 0
-    while i < len(last) and last[i].isspace():
-        i += 1
-    if i >= len(last) or last[i] != "{":
-        return None
-    depth, end = 0, None
-    for j in range(i, len(last)):
-        if last[j] == "{":
-            depth += 1
-        elif last[j] == "}":
-            depth -= 1
-            if depth == 0:
-                end = j
-                break
-    return last[i + 1:end] if end is not None else None
 
 
 def prepare_model_dir(model_path, weights_pth, tmp_root):
@@ -135,32 +122,63 @@ def main():
     elapsed = time.time() - t0
     print(f"[EVAL] Done in {elapsed:.1f}s")
 
-    results, total_correct = [], 0.0
+    results = []
+    total_strict  = 0.0
+    total_relaxed = 0.0
+
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
-        gt     = data["ground_truth"]
-        scores = [compute_training_score(o.text, gt) for o in output.outputs]
-        avg    = sum(scores) / len(scores)
-        total_correct += avg
+        gt = data["ground_truth"]
 
-        extracted = _extract_last_boxed(output.outputs[0].text)
-        tag = "CORRECT" if avg >= 1.0 else ("PARTIAL" if avg > 0 else "WRONG")
+        # Per-sample strict (official) and relaxed (diagnostic) scores.
+        sample_strict_scores  = [
+            compute_math500_eval_score(o.text, gt, mode="strict")  for o in output.outputs
+        ]
+        sample_relaxed_scores = [
+            compute_math500_eval_score(o.text, gt, mode="relaxed") for o in output.outputs
+        ]
 
+        avg_strict  = sum(sample_strict_scores)  / len(sample_strict_scores)
+        avg_relaxed = sum(sample_relaxed_scores) / len(sample_relaxed_scores)
+
+        total_strict  += avg_strict
+        total_relaxed += avg_relaxed
+
+        # Extracted answers from the primary (first) sample, for logging.
+        strict_extracted  = extract_final_answer_strict(output.outputs[0].text)
+        relaxed_extracted = extract_final_answer_relaxed(output.outputs[0].text)
+
+        tag = "CORRECT" if avg_strict >= 1.0 else ("PARTIAL" if avg_strict > 0 else "WRONG")
         print(f"\n{'='*70}\n[{idx+1}/{len(task_datas)}] {tag}")
-        print(f"Q: {data['question'][:200]}\nGT: {gt}  |  Ans: {extracted}")
+        print(f"Q: {data['question'][:200]}")
+        print(f"GT: {gt}  |  Strict: {strict_extracted}  |  Relaxed: {relaxed_extracted}")
         print(output.outputs[0].text)
         if args.n_samples > 1:
-            print(f"avg@{args.n_samples}={avg:.2f}")
+            print(f"avg@{args.n_samples}  strict={avg_strict:.2f}  relaxed={avg_relaxed:.2f}")
 
         results.append({
-            "idx": idx, "question": data["question"], "ground_truth": gt,
-            "extracted_answer": extracted, "avg_score": avg,
-            "sample_scores": scores, "data_source": data["data_source"],
-            "model_responses": [o.text for o in output.outputs],
+            "idx":                      idx,
+            "question":                 data["question"],
+            "ground_truth":             gt,
+            "strict_extracted_answer":  strict_extracted,
+            "relaxed_extracted_answer": relaxed_extracted,
+            "strict_score":             avg_strict,
+            "relaxed_score":            avg_relaxed,
+            "sample_strict_scores":     sample_strict_scores,
+            "sample_relaxed_scores":    sample_relaxed_scores,
+            "data_source":              data["data_source"],
+            "model_responses":          [o.text for o in output.outputs],
         })
 
-    accuracy  = total_correct / len(task_datas) if task_datas else 0.0
-    n_correct = int(round(total_correct))
-    print(f"\n{'='*70}\n  Math500: {accuracy*100:.2f}%  ({n_correct}/{len(task_datas)})\n{'='*70}\n")
+    n = len(task_datas)
+    strict_acc  = total_strict  / n if n else 0.0
+    relaxed_acc = total_relaxed / n if n else 0.0
+    n_strict_correct  = int(round(total_strict))
+    n_relaxed_correct = int(round(total_relaxed))
+
+    print(f"\n{'='*70}")
+    print(f"  Math500 STRICT  (official): {strict_acc*100:.2f}%  ({n_strict_correct}/{n})")
+    print(f"  Math500 RELAXED (diag.   ): {relaxed_acc*100:.2f}%  ({n_relaxed_correct}/{n})")
+    print(f"{'='*70}\n")
 
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     rp = os.path.join(args.output_dir, f"results_{ts}.jsonl")
@@ -170,11 +188,21 @@ def main():
         for r in results:
             f.write(json.dumps(r) + "\n")
     with open(sp, "w") as f:
-        json.dump({"accuracy": accuracy, "correct": n_correct, "total": len(task_datas),
-                   "model_path": args.model_path, "weights_pth": args.weights_pth,
-                   "temperature": args.temperature, "max_tokens": args.max_tokens,
-                   "n_samples": args.n_samples, "tensor_parallel_size": args.tensor_parallel_size,
-                   "generation_time_s": elapsed, "timestamp": datetime.utcnow().isoformat() + "Z"}, f, indent=2)
+        json.dump({
+            "strict_accuracy":      strict_acc,
+            "relaxed_accuracy":     relaxed_acc,
+            "strict_correct":       n_strict_correct,
+            "relaxed_correct":      n_relaxed_correct,
+            "total":                n,
+            "model_path":           args.model_path,
+            "weights_pth":          args.weights_pth,
+            "temperature":          args.temperature,
+            "max_tokens":           args.max_tokens,
+            "n_samples":            args.n_samples,
+            "tensor_parallel_size": args.tensor_parallel_size,
+            "generation_time_s":    elapsed,
+            "timestamp":            datetime.utcnow().isoformat() + "Z",
+        }, f, indent=2)
 
     print(f"[OUT] {rp}\n[OUT] {sp}")
     if tmp_dir:
