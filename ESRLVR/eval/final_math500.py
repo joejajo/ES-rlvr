@@ -34,6 +34,7 @@ from vllm import LLM, SamplingParams
 
 # SYSTEM_PROMPT only — no training reward logic imported.
 from reward.deepscaler import SYSTEM_PROMPT
+from utils.ckpt_utils import unfuse_vllm_state_dict
 from eval.math500_grader import (
     compute_math500_eval_score,
     extract_final_answer_relaxed,
@@ -86,6 +87,7 @@ def prepare_model_dir(model_path, weights_pth, tmp_root):
         return model_path, None
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, device_map="cpu")
     state_dict = torch.load(weights_pth, map_location="cpu", weights_only=True)
+    state_dict = unfuse_vllm_state_dict(state_dict, model.config)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:    print(f"[WEIGHTS] Missing    {len(missing)}: {missing[:3]}")
     if unexpected: print(f"[WEIGHTS] Unexpected {len(unexpected)}: {unexpected[:3]}")

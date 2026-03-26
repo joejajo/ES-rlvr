@@ -14,6 +14,8 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from utils.ckpt_utils import unfuse_vllm_state_dict
+
 
 def export_checkpoint(model_path, weights_pth, output_dir):
     print(f"[EXPORT] Base   : {model_path}")
@@ -23,6 +25,7 @@ def export_checkpoint(model_path, weights_pth, output_dir):
     tokenizer  = AutoTokenizer.from_pretrained(model_path)
     model      = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, device_map="cpu")
     state_dict = torch.load(weights_pth, map_location="cpu", weights_only=True)
+    state_dict = unfuse_vllm_state_dict(state_dict, model.config)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:    print(f"[EXPORT] Missing    {len(missing)}: {missing[:3]}")
     if unexpected: print(f"[EXPORT] Unexpected {len(unexpected)}: {unexpected[:3]}")
