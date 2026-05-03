@@ -74,7 +74,7 @@ except ImportError:
             s.bind(("", 0))
             return s.getsockname()[1]
 
-from deepscaler import compute_training_score
+from deepscaler import compute_training_score, compute_score_routed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -419,6 +419,9 @@ def run_validation(engine, val_task_datas: list, writer,
                    iteration: int, max_tokens: int = 2048) -> float:
     """
     Greedy evaluation of engine's current weights on val_task_datas.
+    Uses compute_score_routed (One-Shot-RLVR data_source-aware grader):
+      simplerl/math500 → math_score.compute_score (Hendrycks is_equiv)
+      deepscaler/aime/… → deepscaler.compute_score (mathd OR sympy)
     Logs val/accuracy to TensorBoard and prints a one-line sample.
     """
     prompts = [d["prompt_str"] for d in val_task_datas]
@@ -427,7 +430,11 @@ def run_validation(engine, val_task_datas: list, writer,
 
     correct = sum(
         1 for out, data in zip(outputs, val_task_datas)
-        if compute_training_score(out.outputs[0].text, data["ground_truth"]) == 1.0
+        if compute_score_routed(
+            data.get("data_source", "deepscaler"),
+            out.outputs[0].text,
+            data["ground_truth"],
+        ) == 1.0
     )
     acc = correct / len(val_task_datas)
     writer.add_scalar("val/accuracy", acc, iteration)
@@ -435,7 +442,8 @@ def run_validation(engine, val_task_datas: list, writer,
     sample_text = outputs[0].outputs[0].text
     boxed = _extract_boxed(sample_text)
     sample_gt = val_task_datas[0]["ground_truth"]
-    sample_correct = compute_training_score(sample_text, sample_gt) == 1.0
+    sample_ds = val_task_datas[0].get("data_source", "deepscaler")
+    sample_correct = compute_score_routed(sample_ds, sample_text, sample_gt) == 1.0
     print(f"\n[VAL] iter={iteration}  accuracy={acc:.4f}  ({correct}/{len(val_task_datas)})")
     print(f"  Sample Q: {val_task_datas[0].get('question', '')[:200]}")
     print(f"  Sample A: {(boxed or '(none)')[:150]}  GT={sample_gt}  "

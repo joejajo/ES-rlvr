@@ -45,7 +45,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 
-from deepscaler import SYSTEM_PROMPT, compute_training_score
+from deepscaler import SYSTEM_PROMPT, compute_score_routed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,7 +248,7 @@ def main():
 
         for req_output in output.outputs:
             completion = _truncate_after_first_boxed(req_output.text)
-            score = compute_training_score(completion, gt)
+            score = compute_score_routed(data["data_source"], completion, gt)
             sample_scores.append(score)
 
         avg_score = sum(sample_scores) / len(sample_scores)
