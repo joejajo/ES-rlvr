@@ -104,6 +104,10 @@ def parse_args():
     parser.add_argument("--parquet_path", type=str,
                         default="Dataset parquet/pi1_r128.parquet",
                         help="Train parquet (verl schema). One-shot: pi1_r128.")
+    parser.add_argument("--val_parquet_path", type=str, default=None,
+                        help="Optional validation parquet (e.g. math500). Evaluated every --val_every iters.")
+    parser.add_argument("--val_every", type=int, default=10,
+                        help="Run validation every N training iterations (default: 10).")
     # ES
     parser.add_argument("--sigma", type=float, default=SIGMA)
     parser.add_argument("--alpha", type=float, default=ALPHA)
@@ -408,8 +412,35 @@ def _postprocess_outputs(outputs, task_datas: list,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plotting
+# Validation
 # ─────────────────────────────────────────────────────────────────────────────
+
+def run_validation(engine, val_task_datas: list, writer,
+                   iteration: int, max_tokens: int = 2048) -> float:
+    """
+    Greedy evaluation of engine's current weights on val_task_datas.
+    Logs val/accuracy to TensorBoard and prints a one-line sample.
+    """
+    prompts = [d["prompt_str"] for d in val_task_datas]
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=42)
+    outputs = ray.get(engine.generate.remote(prompts, sampling_params, use_tqdm=False))
+
+    correct = sum(
+        1 for out, data in zip(outputs, val_task_datas)
+        if compute_training_score(out.outputs[0].text, data["ground_truth"]) == 1.0
+    )
+    acc = correct / len(val_task_datas)
+    writer.add_scalar("val/accuracy", acc, iteration)
+
+    sample_text = outputs[0].outputs[0].text
+    boxed = _extract_boxed(sample_text)
+    sample_gt = val_task_datas[0]["ground_truth"]
+    sample_correct = compute_training_score(sample_text, sample_gt) == 1.0
+    print(f"\n[VAL] iter={iteration}  accuracy={acc:.4f}  ({correct}/{len(val_task_datas)})")
+    print(f"  Sample Q: {val_task_datas[0].get('question', '')[:200]}")
+    print(f"  Sample A: {(boxed or '(none)')[:150]}  GT={sample_gt}  "
+          f"[{'CORRECT' if sample_correct else 'WRONG'}]")
+    return acc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -455,6 +486,12 @@ def main(args):
     print(f"\n[DATA] Loading train: {args.parquet_path}")
     train_task_datas = load_task_datas(args.parquet_path, tokenizer)
     print(f"[DATA] {len(train_task_datas)} train examples loaded.")
+
+    val_task_datas = []
+    if args.val_parquet_path:
+        print(f"[DATA] Loading val  : {args.val_parquet_path}")
+        val_task_datas = load_task_datas(args.val_parquet_path, tokenizer)
+        print(f"[DATA] {len(val_task_datas)} val examples loaded.")
 
     # ── Launch engines ────────────────────────────────────────────────────────
     print(f"\n[ENGINES] Launching {args.num_engines} vLLM engines...")
@@ -505,6 +542,8 @@ def main(args):
     print(f"  Engines (GPUs) : {args.num_engines}")
     print(f"  Iterations     : {args.num_iterations}")
     print(f"  Train examples : {len(train_task_datas)}")
+    if val_task_datas:
+        print(f"  Val examples   : {len(val_task_datas)}  (every {args.val_every} iters)")
     print(f"  Log dir        : {logging_dir}")
     print("=" * 70 + "\n")
 
@@ -611,11 +650,14 @@ def main(args):
 
         mean_r   = float(np.mean(all_rewards))      if all_rewards     else 0.0
         std_r    = float(np.std(all_rewards))       if all_rewards     else 0.0
+        min_r    = float(np.min(all_rewards))       if all_rewards     else 0.0
+        max_r    = float(np.max(all_rewards))       if all_rewards     else 0.0
         mean_c   = float(np.mean(all_correctness))  if all_correctness else 0.0
         mean_e   = float(np.mean(all_entropy))      if all_entropy     else 0.0
         mean_cov = float(np.mean(all_coverage))     if all_coverage    else 0.0
 
         print(f"\n[REWARD]  mean={mean_r:.4f}  std={std_r:.4f}  "
+              f"min={min_r:.4f}  max={max_r:.4f}  "
               f"correctness={mean_c:.4f}  entropy={mean_e:.4f}  "
               f"coverage={mean_cov:.4f}")
 
@@ -632,6 +674,8 @@ def main(args):
         # Log to TensorBoard
         writer.add_scalar("reward/mean",              mean_r,   i)
         writer.add_scalar("reward/std",               std_r,    i)
+        writer.add_scalar("reward/min",               min_r,    i)
+        writer.add_scalar("reward/max",               max_r,    i)
         writer.add_scalar("reward/correctness",       mean_c,   i)
         writer.add_scalar("reward/entropy",           mean_e,   i)
         writer.add_scalar("reward/entropy_coverage",  mean_cov, i)
@@ -678,6 +722,10 @@ def main(args):
         if args.verbose:
             print(f"  Broadcast in {t_broadcast:.2f}s")
         writer.add_scalar("time/broadcast", t_broadcast, i)
+
+        # ── Periodic validation ───────────────────────────────────────────────
+        if val_task_datas and (i % args.val_every == 0):
+            run_validation(engines[0], val_task_datas, writer, i)
 
         # ── Iteration timing ──────────────────────────────────────────────────
         t_iter = time.time() - total_iter_start

@@ -28,6 +28,7 @@ class WorkerExtension:
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         return True
 
     def restore_self_weights(self, seed, sigma, iid_noise=False, negate=False):
@@ -40,6 +41,7 @@ class WorkerExtension:
             del noise
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         return True
 
     def init_inter_engine_group(self, master_address: str, master_port: int, rank: int, world_size: int):
