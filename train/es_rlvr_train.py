@@ -122,7 +122,9 @@ def parse_args():
 
 class ESNcclLLM(LLM):
     def __init__(self, *args, **kwargs):
-        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        # Do NOT pop CUDA_VISIBLE_DEVICES — Ray sets it from the placement group
+        # to exactly the one GPU assigned to this actor. Popping it causes
+        # vLLM's nested Ray workers to see no GPUs.
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         super().__init__(*args, **kwargs)
 
@@ -143,7 +145,10 @@ def launch_engines(num_engines: int, model_path: str):
         )(ESNcclLLM).remote(
             model=model_path,
             tensor_parallel_size=1,
-            distributed_executor_backend="ray",
+            # No distributed_executor_backend="ray": vLLM v1 would spawn its own
+            # Ray workers requesting num_gpus=1, conflicting with our placement
+            # groups which already own those GPUs. UniProcExecutor (the default
+            # for TP=1) runs the model in-process — no sub-workers needed.
             worker_extension_cls="utils.worker_extn.WorkerExtension",
             dtype="float16",
             enable_prefix_caching=False,
