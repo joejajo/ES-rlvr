@@ -59,7 +59,7 @@ from reward.deepscaler import compute_training_score
 SIGMA           = 0.001
 ALPHA           = 0.0005
 POPULATION_SIZE = 30
-NUM_ENGINES     = 4
+NUM_ENGINES     = 2
 NUM_ITERATIONS  = 1000
 
 
@@ -77,20 +77,26 @@ def parse_args():
     p.add_argument("--population_size",  type=int,   default=POPULATION_SIZE)
     p.add_argument("--num_engines",      type=int,   default=NUM_ENGINES)
     p.add_argument("--num_iterations",   type=int,   default=NUM_ITERATIONS)
-    p.add_argument("--cuda_devices",     type=str,   default="0,1,2,3")
+    p.add_argument("--cuda_devices",     type=str,   default="0,1")
     p.add_argument("--global_seed",      type=int,   default=None)
-    p.add_argument("--max_tokens",        type=int,   default=4096,
-                   help="Max generation tokens per sample during training.")
+    p.add_argument("--max_tokens",        type=int,   default=3076,
+                   help="Max new tokens generated per rollout (default: 3076).")
+    p.add_argument("--max_prompt_tokens", type=int,   default=1024,
+                   help="Truncate prompts to this many tokens before generation (default: 1024).")
     p.add_argument("--output_every",     type=int,   default=1)
-    p.add_argument("--val_every",        type=int,   default=50)
+    p.add_argument("--val_every",        type=int,   default=20,
+                   help="Run inline validation every N iterations (default: 20).")
     p.add_argument("--val_before_train", action="store_true",
                    help="Run inline validation once before ES training starts.")
+    p.add_argument("--train_temperature", type=float, default=0.6,
+                   help="Sampling temperature for ES perturbation rollouts (default: 0.6).")
     p.add_argument("--val_temperature", type=float, default=0.6,
-                   help="Sampling temperature for inline validation.")
+                   help="Sampling temperature for inline validation (default: 0.6).")
     p.add_argument("--val_sampling_seed", type=int, default=None,
                    help="Optional fixed seed for inline validation (reproducible results).")
-    p.add_argument("--save_every",       type=int,   default=50,
-                   help="Save model outputs to JSONL every N iterations.")
+    p.add_argument("--save_every",       type=int,   default=20,
+                   help="Save checkpoint every N iterations (default: 20). "
+                        "Previous checkpoint is deleted when a new one is saved.")
     p.add_argument("--n_rollouts_per_prompt", type=int, default=4,
                    help="Completions per prompt per perturbation (K rollouts). Default=4.")
     p.add_argument("--verbose",          action="store_true")
@@ -152,7 +158,7 @@ def launch_engines(num_engines: int, model_path: str):
 # Data
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_task_datas(parquet_path: str, tokenizer) -> list:
+def load_task_datas(parquet_path: str, tokenizer, max_prompt_tokens: int = 1024) -> list:
     if not os.path.exists(parquet_path):
         raise FileNotFoundError(f"Parquet not found: {parquet_path}")
     df = pd.read_parquet(parquet_path)
@@ -160,6 +166,7 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
         raise RuntimeError(f"Parquet has zero rows: {parquet_path}")
 
     task_datas = []
+    truncated = 0
     for _, row in df.iterrows():
         chat = list(row["prompt"])
         reward_model = row["reward_model"]
@@ -168,6 +175,12 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
         prompt_str = tokenizer.apply_chat_template(
             chat, tokenize=False, add_generation_prompt=True
         )
+        # Truncate prompt to max_prompt_tokens if needed
+        ids = tokenizer.encode(prompt_str)
+        if len(ids) > max_prompt_tokens:
+            ids = ids[:max_prompt_tokens]
+            prompt_str = tokenizer.decode(ids, skip_special_tokens=False)
+            truncated += 1
         question = next(
             (m.get("content", "") for m in chat
              if isinstance(m, dict) and m.get("role") == "user"), ""
@@ -178,6 +191,8 @@ def load_task_datas(parquet_path: str, tokenizer) -> list:
             "data_source":  str(row.get("data_source", "deepscaler")),
             "question":     question,
         })
+    if truncated:
+        print(f"[DATA] {truncated}/{len(task_datas)} prompts truncated to {max_prompt_tokens} tokens.")
     return task_datas
 
 
@@ -336,14 +351,14 @@ def main(args):
 
     # Data
     print(f"\n[DATA] train: {args.parquet_path}")
-    train_data = load_task_datas(args.parquet_path, tokenizer)
+    train_data = load_task_datas(args.parquet_path, tokenizer, args.max_prompt_tokens)
     print(f"[DATA] {len(train_data)} train examples.")
 
     val_data = []
     if args.val_every > 0:
         if os.path.exists(args.val_parquet_path):
             print(f"[DATA] val:   {args.val_parquet_path}")
-            val_data = load_task_datas(args.val_parquet_path, tokenizer)
+            val_data = load_task_datas(args.val_parquet_path, tokenizer, args.max_prompt_tokens)
             print(f"[DATA] {len(val_data)} val examples.")
         else:
             print(f"[DATA] val path not found — inline val disabled.")
@@ -408,6 +423,7 @@ def main(args):
         writer.add_scalar("val_before_train/math500_acc", pre_val_acc, 0)
 
     # ── Training loop ─────────────────────────────────────────────────────────
+    last_ckpt = None  # track most recent checkpoint for deletion on next save
     for i in range(start_iter, args.num_iterations):
         print(f"{'─'*50}  iter {i}/{args.num_iterations-1}")
         t0 = time.time()
@@ -423,7 +439,8 @@ def main(args):
             try: seed = next(seed_iter)
             except StopIteration: break
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
-            h, ts = evaluate_handle(llm, train_data, max_tokens=args.max_tokens,
+            h, ts = evaluate_handle(llm, train_data, temperature=args.train_temperature,
+                                    max_tokens=args.max_tokens,
                                     n_rollouts_per_prompt=args.n_rollouts_per_prompt)
             inflight[h] = {"engine": llm, "eng_idx": eng_idx, "seed": seed, "ts": ts}
 
@@ -449,7 +466,8 @@ def main(args):
             ray.get(meta["engine"].collective_rpc.remote(
                 "perturb_self_weights", args=(next_seed, args.sigma, False)
             ))
-            h, ts = evaluate_handle(meta["engine"], train_data, max_tokens=args.max_tokens,
+            h, ts = evaluate_handle(meta["engine"], train_data, temperature=args.train_temperature,
+                                    max_tokens=args.max_tokens,
                                     n_rollouts_per_prompt=args.n_rollouts_per_prompt)
             inflight[h] = {"engine": meta["engine"], "eng_idx": meta["eng_idx"],
                            "seed": next_seed, "ts": ts}
@@ -469,20 +487,6 @@ def main(args):
         writer.add_scalar("reward/std",     std_r,  i)
         writer.add_scalar("reward/entropy", mean_e, i)
 
-        if i % args.save_every == 0:
-            with open(train_jsonl, "a", encoding="utf-8") as f:
-                for s, v in seeds_perf.items():
-                    for sample in v.get("samples", []):
-                        f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
-
-            iter_ckpt = os.path.join("checkpoints", f"iter{i}_{run_tag}")
-            os.makedirs(iter_ckpt, exist_ok=True)
-            ckpt_pth = os.path.join(iter_ckpt, "pytorch_model.pth")
-            ray.get(engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(ckpt_pth,)))
-            with open(os.path.join(iter_ckpt, "resume_state.json"), "w") as f:
-                json.dump({"last_iter": i, "run_tag": run_tag}, f, indent=2)
-            print(f"[CKPT] Saved checkpoint → {iter_ckpt}")
-
         # ES update on engine 0 then broadcast
         ray.get([
             engines[0].collective_rpc.remote(
@@ -493,17 +497,40 @@ def main(args):
         ])
         ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
 
-        # Inline val
-        if args.val_every > 0 and val_data and (i + 1) % args.val_every == 0:
-            from eval.inline_val import run_inline_val
-            val_acc = run_inline_val(
-                engines[0], val_data,
-                out_dir=val_preds, run_tag=run_tag, iteration=i,
-                temperature=args.val_temperature,
-                max_tokens=args.max_tokens,
-                sampling_seed=args.val_sampling_seed,
-            )
-            writer.add_scalar("val/math500_acc", val_acc, i)
+        # ── Every save_every iters: checkpoint (updated weights) + eval ───────
+        if (i + 1) % args.save_every == 0:
+            # JSONL log
+            with open(train_jsonl, "a", encoding="utf-8") as f:
+                for s, v in seeds_perf.items():
+                    for sample in v.get("samples", []):
+                        f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
+
+            # Save checkpoint (post-update weights)
+            iter_ckpt = os.path.join("checkpoints", f"iter{i+1}_{run_tag}")
+            os.makedirs(iter_ckpt, exist_ok=True)
+            ckpt_pth = os.path.join(iter_ckpt, "pytorch_model.pth")
+            ray.get(engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(ckpt_pth,)))
+            with open(os.path.join(iter_ckpt, "resume_state.json"), "w") as f:
+                json.dump({"last_iter": i, "run_tag": run_tag}, f, indent=2)
+            print(f"[CKPT] Saved → {iter_ckpt}")
+
+            # Delete previous checkpoint to save disk space
+            if last_ckpt and os.path.exists(last_ckpt):
+                shutil.rmtree(last_ckpt, ignore_errors=True)
+                print(f"[CKPT] Deleted old checkpoint: {last_ckpt}")
+            last_ckpt = iter_ckpt
+
+            # Inline eval immediately after checkpoint
+            if val_data:
+                from eval.inline_val import run_inline_val
+                val_acc = run_inline_val(
+                    engines[0], val_data,
+                    out_dir=val_preds, run_tag=run_tag, iteration=i + 1,
+                    temperature=args.val_temperature,
+                    max_tokens=args.max_tokens,
+                    sampling_seed=args.val_sampling_seed,
+                )
+                writer.add_scalar("val/math500_acc", val_acc, i)
 
         writer.add_scalar("time/iter", time.time() - t0, i)
         print(f"[ITER] {time.time() - t0:.1f}s\n")

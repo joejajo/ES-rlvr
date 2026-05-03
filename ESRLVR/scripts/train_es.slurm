@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=es_rlvr
 #SBATCH --partition=a100
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:a100:2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=48:00:00
@@ -9,9 +9,9 @@
 #SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.err
 #SBATCH --export=NONE
 # =============================================================================
-#  ES-RLVR — 4-GPU SLURM script
+#  ES-RLVR — 2-GPU SLURM script
 #
-#  One-Shot-RLVR + vLLM + Ray + NCCL, 4 engines across 4 GPUs.
+#  One-Shot-RLVR + vLLM + Ray + NCCL, 2 engines across 2 GPUs.
 # =============================================================================
 unset SLURM_EXPORT_ENV
 set -eo pipefail
@@ -45,7 +45,7 @@ MODEL_NAME="${MODEL_NAME:-/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B}"
 SIGMA="${SIGMA:-0.001}"
 ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-30}"
-NUM_ENGINES="${NUM_ENGINES:-4}"
+NUM_ENGINES="${NUM_ENGINES:-2}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
 N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-4}"
 GLOBAL_SEED="${GLOBAL_SEED:-}"
@@ -65,7 +65,7 @@ python "${SCRIPT}" \
   --population_size   "${POPULATION_SIZE}" \
   --num_engines       "${NUM_ENGINES}" \
   --num_iterations    "${NUM_ITERATIONS}" \
-  --cuda_devices      0,1,2,3 \
+  --cuda_devices      0,1 \
   ${SEED_ARG} \
   ${RESUME_ARG} \
   --n_rollouts_per_prompt "${N_ROLLOUTS_PER_PROMPT}" \
