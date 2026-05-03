@@ -5,6 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=48:00:00
+#SBATCH --signal=SIGUSR1@120
 #SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.out
 #SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.err
 #SBATCH --export=NONE
@@ -50,7 +51,12 @@ NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
 N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-4}"
 GLOBAL_SEED="${GLOBAL_SEED:-}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"       # print prompt+response every N iters
-RESUME_FROM="${RESUME_FROM:-}"          # path to checkpoint dir; empty = fresh run
+RESUME_FROM="${RESUME_FROM:-}"          # path to checkpoint dir; empty = auto-detect
+# Auto-resume from checkpoints/latest if RESUME_FROM not explicitly set
+if [[ -z "${RESUME_FROM}" && -L "${BASE_DIR}/checkpoints/latest" ]]; then
+    RESUME_FROM="$(readlink -f "${BASE_DIR}/checkpoints/latest")"
+    echo "[AUTO-RESUME] Found checkpoint: ${RESUME_FROM}"
+fi
 TRAIN_TEMPERATURE="${TRAIN_TEMPERATURE:-0.6}"
 VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.6}"
 SAVE_EVERY="${SAVE_EVERY:-20}"

@@ -397,8 +397,35 @@ def main(args):
             except Exception: pass
         ray.shutdown()
 
+    def _save_checkpoint(i, last_ckpt):
+        """Save post-update weights; update checkpoints/latest symlink; delete previous."""
+        iter_ckpt = os.path.join("checkpoints", f"iter{i+1}_{run_tag}")
+        os.makedirs(iter_ckpt, exist_ok=True)
+        ckpt_pth = os.path.join(iter_ckpt, "pytorch_model.pth")
+        ray.get(engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(ckpt_pth,)))
+        with open(os.path.join(iter_ckpt, "resume_state.json"), "w") as f:
+            json.dump({"last_iter": i, "run_tag": run_tag}, f, indent=2)
+        print(f"[CKPT] Saved → {iter_ckpt}")
+        latest_link = os.path.join("checkpoints", "latest")
+        if os.path.islink(latest_link):
+            os.remove(latest_link)
+        os.symlink(os.path.abspath(iter_ckpt), latest_link)
+        if last_ckpt and os.path.exists(last_ckpt):
+            shutil.rmtree(last_ckpt, ignore_errors=True)
+            print(f"[CKPT] Deleted old checkpoint: {last_ckpt}")
+        return iter_ckpt
+
+    # SIGUSR1 is sent by SLURM 120 s before the job time limit.
+    # We set a flag so the current iteration finishes cleanly before we exit.
+    preempt = [False]
+    def _handle_preempt(signum, frame):
+        preempt[0] = True
+        print(f"\n[SIGNAL] {'SIGUSR1' if signum == signal.SIGUSR1 else 'SIGTERM'} received "
+              f"— will checkpoint at end of this iteration and exit.", flush=True)
+
+    signal.signal(signal.SIGUSR1, _handle_preempt)
+    signal.signal(signal.SIGTERM, _handle_preempt)
     signal.signal(signal.SIGINT,  lambda s, f: (cleanup(), sys.exit(0)))
-    signal.signal(signal.SIGTERM, lambda s, f: (cleanup(), sys.exit(0)))
 
     print("=" * 70)
     print(f"  Model     : {args.model_name}")
@@ -516,28 +543,13 @@ def main(args):
 
         # ── Every save_every iters: checkpoint (updated weights) + eval ───────
         if (i + 1) % args.save_every == 0:
-            # JSONL log
             with open(train_jsonl, "a", encoding="utf-8") as f:
                 for s, v in seeds_perf.items():
                     for sample in v.get("samples", []):
                         f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
 
-            # Save checkpoint (post-update weights)
-            iter_ckpt = os.path.join("checkpoints", f"iter{i+1}_{run_tag}")
-            os.makedirs(iter_ckpt, exist_ok=True)
-            ckpt_pth = os.path.join(iter_ckpt, "pytorch_model.pth")
-            ray.get(engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(ckpt_pth,)))
-            with open(os.path.join(iter_ckpt, "resume_state.json"), "w") as f:
-                json.dump({"last_iter": i, "run_tag": run_tag}, f, indent=2)
-            print(f"[CKPT] Saved → {iter_ckpt}")
+            last_ckpt = _save_checkpoint(i, last_ckpt)
 
-            # Delete previous checkpoint to save disk space
-            if last_ckpt and os.path.exists(last_ckpt):
-                shutil.rmtree(last_ckpt, ignore_errors=True)
-                print(f"[CKPT] Deleted old checkpoint: {last_ckpt}")
-            last_ckpt = iter_ckpt
-
-            # Inline eval immediately after checkpoint
             if val_data:
                 from eval.inline_val import run_inline_val
                 val = run_inline_val(
@@ -555,6 +567,14 @@ def main(args):
         writer.add_scalar("time/iter", time.time() - t0, i)
         print(f"[ITER] {time.time() - t0:.1f}s\n")
         gc.collect()
+
+        # ── Preempt checkpoint: SLURM timeout warning (SIGUSR1 / SIGTERM) ────
+        if preempt[0]:
+            print("[PREEMPT] Saving emergency checkpoint before exit ...")
+            _save_checkpoint(i, last_ckpt)
+            writer.flush()
+            cleanup()
+            sys.exit(0)
 
     # Save
     ckpt = os.path.join("checkpoints", f"final_iter{args.num_iterations}_{run_tag}")
