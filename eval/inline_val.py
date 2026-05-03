@@ -80,14 +80,24 @@ def run_inline_val(engine, val_task_datas, out_dir, run_tag, iteration,
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    num_correct  = int(round(sum(scores)))
-    num_parse_ok = sum(int(r["parse_ok"]) for r in records)
-    num_boxed    = sum(int(r["boxed_found"]) for r in records)
+    num_correct      = int(round(sum(scores)))
+    num_parse_ok     = sum(int(r["parse_ok"])    for r in records)
+    num_boxed        = sum(int(r["boxed_found"]) for r in records)
+    mean_resp_len    = float(np.mean([r["response_len"] for r in records])) if records else 0.0
+    parse_ok_frac    = num_parse_ok / len(records) if records else 0.0
+    boxed_frac       = num_boxed    / len(records) if records else 0.0
     print(
         f"[VAL] iter={iteration}  acc={accuracy*100:.2f}%"
         f"  ({num_correct}/{len(scores)})"
         f"  parse_ok={num_parse_ok}/{len(records)}"
         f"  boxed={num_boxed}/{len(records)}"
+        f"  mean_len={mean_resp_len:.0f}"
         f"  T={temperature}  {elapsed:.1f}s  → {out_path}"
     )
-    return accuracy
+    return {
+        "accuracy":        accuracy,
+        "parse_ok_frac":   parse_ok_frac,
+        "boxed_frac":      boxed_frac,
+        "mean_response_len": mean_resp_len,
+        "elapsed":         elapsed,
+    }

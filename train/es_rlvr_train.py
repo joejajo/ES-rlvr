@@ -413,14 +413,17 @@ def main(args):
     # ── Pre-train validation ───────────────────────────────────────────────────
     if args.val_before_train and val_data:
         from eval.inline_val import run_inline_val
-        pre_val_acc = run_inline_val(
+        pre_val = run_inline_val(
             engines[0], val_data,
             out_dir=val_preds, run_tag=run_tag, iteration=-1,
             temperature=args.val_temperature,
             max_tokens=args.max_tokens,
             sampling_seed=args.val_sampling_seed,
         )
-        writer.add_scalar("val_before_train/math500_acc", pre_val_acc, 0)
+        writer.add_scalar("val/accuracy",          pre_val["accuracy"],          0)
+        writer.add_scalar("val/parse_ok_frac",     pre_val["parse_ok_frac"],     0)
+        writer.add_scalar("val/boxed_frac",        pre_val["boxed_frac"],        0)
+        writer.add_scalar("val/mean_response_len", pre_val["mean_response_len"], 0)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     last_ckpt = None  # track most recent checkpoint for deletion on next save
@@ -481,15 +484,25 @@ def main(args):
         for v in seeds_perf.values():
             v["norm"] = (v["avg_reward"] - mean_r) / (std_r + 1e-8)
 
-        mean_e = float(np.mean([v["avg_entropy"]  for v in seeds_perf.values()])) if seeds_perf else 0.0
-        mean_c = float(np.mean([v["avg_coverage"] for v in seeds_perf.values()])) if seeds_perf else 0.0
-        print(f"[REWARD] mean={mean_r:.4f} std={std_r:.4f} ent={mean_e:.4f} cov={mean_c:.4f}")
+        mean_e       = float(np.mean([v["avg_entropy"]  for v in seeds_perf.values()])) if seeds_perf else 0.0
+        mean_c       = float(np.mean([v["avg_coverage"] for v in seeds_perf.values()])) if seeds_perf else 0.0
+        nonzero_frac = float(sum(1 for r in all_r if r > 0) / len(all_r)) if all_r else 0.0
+        all_resp_lens = [
+            len(sample["model_response"])
+            for v in seeds_perf.values()
+            for sample in v.get("samples", [])
+        ]
+        mean_resp_len = float(np.mean(all_resp_lens)) if all_resp_lens else 0.0
+        print(f"[REWARD] mean={mean_r:.4f} std={std_r:.4f} ent={mean_e:.4f} cov={mean_c:.4f} nonzero={nonzero_frac:.2f}")
 
-        writer.add_scalar("reward/mean",    mean_r, i)
-        writer.add_scalar("reward/std",     std_r,  i)
-        writer.add_scalar("reward/min",     float(min(all_r)) if all_r else 0.0, i)
-        writer.add_scalar("reward/max",     float(max(all_r)) if all_r else 0.0, i)
-        writer.add_scalar("reward/entropy", mean_e, i)
+        writer.add_scalar("reward/mean",         mean_r,       i)
+        writer.add_scalar("reward/std",          std_r,        i)
+        writer.add_scalar("reward/min",          float(min(all_r)) if all_r else 0.0, i)
+        writer.add_scalar("reward/max",          float(max(all_r)) if all_r else 0.0, i)
+        writer.add_scalar("reward/entropy",      mean_e,       i)
+        writer.add_scalar("reward/coverage",     mean_c,       i)
+        writer.add_scalar("train/nonzero_frac",  nonzero_frac, i)
+        writer.add_scalar("train/mean_response_len", mean_resp_len, i)
 
         # ES update on engine 0 then broadcast
         ray.get([
@@ -527,14 +540,17 @@ def main(args):
             # Inline eval immediately after checkpoint
             if val_data:
                 from eval.inline_val import run_inline_val
-                val_acc = run_inline_val(
+                val = run_inline_val(
                     engines[0], val_data,
                     out_dir=val_preds, run_tag=run_tag, iteration=i + 1,
                     temperature=args.val_temperature,
                     max_tokens=args.max_tokens,
                     sampling_seed=args.val_sampling_seed,
                 )
-                writer.add_scalar("val/math500_acc", val_acc, i)
+                writer.add_scalar("val/accuracy",          val["accuracy"],          i)
+                writer.add_scalar("val/parse_ok_frac",     val["parse_ok_frac"],     i)
+                writer.add_scalar("val/boxed_frac",        val["boxed_frac"],        i)
+                writer.add_scalar("val/mean_response_len", val["mean_response_len"], i)
 
         writer.add_scalar("time/iter", time.time() - t0, i)
         print(f"[ITER] {time.time() - t0:.1f}s\n")
