@@ -452,6 +452,8 @@ def main(args):
 
             do_debug = debug_iter and not debug_fired
             metrics  = _postprocess_outputs(outputs, train_data, debug_print=do_debug)
+            del outputs
+            gc.collect()
             if do_debug:
                 debug_fired = True
 
@@ -485,6 +487,8 @@ def main(args):
 
         writer.add_scalar("reward/mean",    mean_r, i)
         writer.add_scalar("reward/std",     std_r,  i)
+        writer.add_scalar("reward/min",     float(min(all_r)) if all_r else 0.0, i)
+        writer.add_scalar("reward/max",     float(max(all_r)) if all_r else 0.0, i)
         writer.add_scalar("reward/entropy", mean_e, i)
 
         # ES update on engine 0 then broadcast
@@ -534,6 +538,7 @@ def main(args):
 
         writer.add_scalar("time/iter", time.time() - t0, i)
         print(f"[ITER] {time.time() - t0:.1f}s\n")
+        gc.collect()
 
     # Save
     ckpt = os.path.join("checkpoints", f"final_iter{args.num_iterations}_{run_tag}")

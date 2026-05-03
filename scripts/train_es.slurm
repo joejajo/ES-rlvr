@@ -49,8 +49,12 @@ NUM_ENGINES="${NUM_ENGINES:-2}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
 N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-4}"
 GLOBAL_SEED="${GLOBAL_SEED:-}"
-OUTPUT_EVERY="${OUTPUT_EVERY:-1}"   # print prompt+response every N iters
-RESUME_FROM="${RESUME_FROM:-}"      # path to checkpoint dir; empty = fresh run
+OUTPUT_EVERY="${OUTPUT_EVERY:-1}"       # print prompt+response every N iters
+RESUME_FROM="${RESUME_FROM:-}"          # path to checkpoint dir; empty = fresh run
+TRAIN_TEMPERATURE="${TRAIN_TEMPERATURE:-0.6}"
+VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.6}"
+SAVE_EVERY="${SAVE_EVERY:-20}"
+VAL_EVERY="${VAL_EVERY:-20}"
 SCRIPT="${BASE_DIR}/train/es_rlvr_train.py"
 SEED_ARG=""
 [[ -n "${GLOBAL_SEED}" ]] && SEED_ARG="--global_seed ${GLOBAL_SEED}"
@@ -70,5 +74,9 @@ python "${SCRIPT}" \
   ${RESUME_ARG} \
   --n_rollouts_per_prompt "${N_ROLLOUTS_PER_PROMPT}" \
   --output_every      "${OUTPUT_EVERY}" \
+  --train_temperature "${TRAIN_TEMPERATURE}" \
+  --val_temperature   "${VAL_TEMPERATURE}" \
+  --save_every        "${SAVE_EVERY}" \
+  --val_every         "${VAL_EVERY}" \
   --verbose
 echo "Job complete: ${SLURM_JOB_ID}"
