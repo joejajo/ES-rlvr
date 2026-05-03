@@ -44,7 +44,7 @@ from eval.math500_grader import (
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model_path",           type=str,   default="Qwen/Qwen2.5-Math-1.5B-Instruct")
+    p.add_argument("--model_path",           type=str,   default="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B")
     p.add_argument("--weights_pth",          type=str,   default=None)
     p.add_argument("--parquet_path",         type=str,   default="data/val/math500.parquet")
     p.add_argument("--output_dir",           type=str,   default="outputs/val_preds")

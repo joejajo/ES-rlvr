@@ -70,7 +70,7 @@ NUM_ITERATIONS  = 200
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model_name",       type=str,   default="Qwen/Qwen2.5-Math-1.5B-Instruct")
+    p.add_argument("--model_name",       type=str,   default="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B")
     p.add_argument("--parquet_path",     type=str,   default="data/train/pi1_r128.parquet")
     p.add_argument("--val_parquet_path", type=str,   default="data/val/math500.parquet")
     p.add_argument("--sigma",            type=float, default=SIGMA)

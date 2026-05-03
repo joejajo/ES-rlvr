@@ -43,7 +43,7 @@ def parse_args():
     p.add_argument(
         "--model_name",
         type=str,
-        default="Qwen/Qwen2.5-Math-1.5B-Instruct",
+        default="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B",
         help="HuggingFace model ID or local path",
     )
     return p.parse_args()

@@ -3,7 +3,7 @@ Merge an ES .pth state dict onto a base HF model and save as HF model directory.
 
 Usage:
     python -m eval.export_checkpoint \\
-        --model_path Qwen/Qwen2.5-Math-1.5B-Instruct \\
+        --model_path /home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B \\
         --weights_pth checkpoints/final_iter200_XXX/pytorch_model.pth \\
         --output_dir  checkpoints/exported_hf_model
 """

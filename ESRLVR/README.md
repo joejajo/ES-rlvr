@@ -35,7 +35,7 @@ ESRLVR/
 
 ```bash
 conda activate grpo
-cd /home/woody/iwi7/iwi7107h/ESRLVR
+cd /home/woody/iwi7/iwi7107h/ESRLVRTHESIS
 ```
 
 ## Training

@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=00:15:00
-#SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.out
-#SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.err
+#SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.out
+#SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.err
 #SBATCH --export=NONE
 # =============================================================================
 #  ES-RLVR — Smoke test (1 GPU, 4-member population, 3 iterations, no val)
@@ -21,7 +21,7 @@ set +u
 conda activate grpo
 set -u
 # ── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVR"
+BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVRTHESIS"
 MODEL_NAME="/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B"
 TRAIN_PARQUET="${BASE_DIR}/data/train/pi1_r128.parquet"
 VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"

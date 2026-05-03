@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=12:00:00
-#SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.out
-#SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.err
+#SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.out
+#SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.err
 #SBATCH --export=NONE
 # =============================================================================
 #  ES-RLVR — 4-GPU SLURM script (global_seed=1234, no fixed sampling seed)
@@ -23,7 +23,7 @@ set +u
 conda activate grpo
 set -u
 # ── Paths ───────────────────────────────────────────────────────────────────
-BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVR"
+BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVRTHESIS"
 TRAIN_PARQUET="${BASE_DIR}/data/train/pi1_r128.parquet"
 VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
 cd "${BASE_DIR}"

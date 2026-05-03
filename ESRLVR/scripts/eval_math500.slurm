@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=2:00:00
-#SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.out
-#SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVR/outputs/%x_%j.err
+#SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.out
+#SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.err
 #SBATCH --export=NONE
 unset SLURM_EXPORT_ENV
 set -eo pipefail
@@ -18,11 +18,11 @@ set +u
 conda activate grpo
 set -u
 # ── Paths ───────────────────────────────────────────────────────────────────
-BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVR"
+BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVRTHESIS"
 VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
 MODEL_NAME="${MODEL_NAME:-/home/woody/iwi7/iwi7107h/models/Qwen2.5-Math-1.5B}"
 # Set WEIGHTS_PTH to evaluate a trained checkpoint; leave empty for base model.
-WEIGHTS_PTH="${WEIGHTS_PTH:-/home/woody/iwi7/iwi7107h/ESRLVR/checkpoints/final_iter300_20260322_045258/pytorch_model.pth}"
+WEIGHTS_PTH="${WEIGHTS_PTH:-/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/checkpoints/final_iter300_20260322_045258/pytorch_model.pth}"
 export PYTHONPATH="${BASE_DIR}:${PYTHONPATH:-}"
 EXTRA=""
 [ -n "${WEIGHTS_PTH}" ] && EXTRA="--weights_pth ${WEIGHTS_PTH}"
