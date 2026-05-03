@@ -79,8 +79,8 @@ def parse_args():
     p.add_argument("--num_iterations",   type=int,   default=NUM_ITERATIONS)
     p.add_argument("--cuda_devices",     type=str,   default="0,1")
     p.add_argument("--global_seed",      type=int,   default=None)
-    p.add_argument("--max_tokens",        type=int,   default=3076,
-                   help="Max new tokens generated per rollout (default: 3076).")
+    p.add_argument("--max_tokens",        type=int,   default=3072,
+                   help="Max new tokens generated per rollout (default: 3072).")
     p.add_argument("--max_prompt_tokens", type=int,   default=1024,
                    help="Truncate prompts to this many tokens before generation (default: 1024).")
     p.add_argument("--output_every",     type=int,   default=1)
