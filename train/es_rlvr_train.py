@@ -318,11 +318,10 @@ def main(args):
     ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
 
     run_tag     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_saves = os.path.join("outputs", f"run_{run_tag}", "model_saves")
     train_preds = os.path.join("outputs", "train_preds")
     val_preds   = os.path.join("outputs", "val_preds")
     tb_dir      = os.path.join("outputs", "tb", f"run_{run_tag}")
-    for d in (model_saves, train_preds, val_preds):
+    for d in (train_preds, val_preds):
         os.makedirs(d, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
 
@@ -342,17 +341,22 @@ def main(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.float16
-    ).to("cpu")
-    base_model_path = os.path.join(model_saves, "base_model")
-    os.makedirs(base_model_path, exist_ok=True)
-    tokenizer.save_pretrained(base_model_path)
-    base_model.save_pretrained(base_model_path)
-    del base_model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Base model snapshot — saved once to a fixed path; skipped on resume
+    base_model_path = os.path.join("outputs", "base_model")
+    if not os.path.exists(os.path.join(base_model_path, "config.json")):
+        print(f"[MODEL] Saving base model to {base_model_path} ...")
+        os.makedirs(base_model_path, exist_ok=True)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model_name, torch_dtype=torch.float16
+        ).to("cpu")
+        tokenizer.save_pretrained(base_model_path)
+        base_model.save_pretrained(base_model_path)
+        del base_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        print(f"[MODEL] Using cached base model at {base_model_path}")
 
     # Data
     print(f"\n[DATA] train: {args.parquet_path}")
@@ -546,28 +550,30 @@ def main(args):
         ])
         ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
 
-        # ── Every save_every iters: checkpoint (updated weights) + eval ───────
+        # ── Every save_every iters: checkpoint (updated weights) ─────────────
+        saved_this_iter = False
         if (i + 1) % args.save_every == 0:
             with open(train_jsonl, "a", encoding="utf-8") as f:
                 for s, v in seeds_perf.items():
                     for sample in v.get("samples", []):
                         f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
-
             last_ckpt = _save_checkpoint(i, last_ckpt)
+            saved_this_iter = True
 
-            if val_data:
-                from eval.inline_val import run_inline_val
-                val = run_inline_val(
-                    engines[0], val_data,
-                    out_dir=val_preds, run_tag=run_tag, iteration=i + 1,
-                    temperature=args.val_temperature,
-                    max_tokens=args.max_tokens,
-                    sampling_seed=args.val_sampling_seed,
-                )
-                writer.add_scalar("val/accuracy",          val["accuracy"],          i)
-                writer.add_scalar("val/parse_ok_frac",     val["parse_ok_frac"],     i)
-                writer.add_scalar("val/boxed_frac",        val["boxed_frac"],        i)
-                writer.add_scalar("val/mean_response_len", val["mean_response_len"], i)
+        # ── Every val_every iters: inline validation ──────────────────────────
+        if val_data and args.val_every > 0 and (i + 1) % args.val_every == 0:
+            from eval.inline_val import run_inline_val
+            val = run_inline_val(
+                engines[0], val_data,
+                out_dir=val_preds, run_tag=run_tag, iteration=i + 1,
+                temperature=args.val_temperature,
+                max_tokens=args.max_tokens,
+                sampling_seed=args.val_sampling_seed,
+            )
+            writer.add_scalar("val/accuracy",          val["accuracy"],          i)
+            writer.add_scalar("val/parse_ok_frac",     val["parse_ok_frac"],     i)
+            writer.add_scalar("val/boxed_frac",        val["boxed_frac"],        i)
+            writer.add_scalar("val/mean_response_len", val["mean_response_len"], i)
 
         writer.add_scalar("time/iter", time.time() - t0, i)
         print(f"[ITER] {time.time() - t0:.1f}s\n")
@@ -575,20 +581,20 @@ def main(args):
 
         # ── Preempt checkpoint: SLURM timeout warning (SIGUSR1 / SIGTERM) ────
         if preempt[0]:
-            print("[PREEMPT] Saving emergency checkpoint before exit ...")
-            _save_checkpoint(i, last_ckpt)
+            if not saved_this_iter:
+                print("[PREEMPT] Saving emergency checkpoint before exit ...")
+                _save_checkpoint(i, last_ckpt)
+            else:
+                print("[PREEMPT] Checkpoint already saved this iteration — exiting.")
             writer.flush()
             cleanup()
             sys.exit(0)
 
-    # Save
-    ckpt = os.path.join("checkpoints", f"final_iter{args.num_iterations}_{run_tag}")
-    os.makedirs(ckpt, exist_ok=True)
-    ray.get(engines[0].collective_rpc.remote(
-        "save_self_weights_to_disk",
-        args=(os.path.join(ckpt, "pytorch_model.pth"),),
-    ))
-    print(f"\n[SAVE] {ckpt}/pytorch_model.pth")
+    # Final save — skip if the last iteration was already a save_every checkpoint
+    if args.num_iterations % args.save_every != 0:
+        _save_checkpoint(args.num_iterations - 1, last_ckpt)
+    else:
+        print(f"\n[SAVE] Final checkpoint already saved at iter {args.num_iterations}.")
 
     cleanup()
     writer.close()
