@@ -3,8 +3,7 @@
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:a100:2
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --time=48:00:00
+#SBATCH --time=16:00:00
 #SBATCH --signal=SIGUSR1@120
 #SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.out
 #SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.err
