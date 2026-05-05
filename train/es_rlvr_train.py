@@ -136,7 +136,7 @@ def launch_engines(num_engines: int, model_path: str):
 
     engines = [
         ray.remote(
-            num_cpus=0, num_gpus=0,
+            num_cpus=0, num_gpus=1,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=pgs[i],
                 placement_group_capture_child_tasks=True,
