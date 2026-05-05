@@ -19,6 +19,9 @@ module purge
 module load cuda/12.4.1
 module load python/3.12-conda
 source "$(conda info --base)/etc/profile.d/conda.sh"
+# Propagate CUDA lib path to all child processes (Ray workers, vLLM)
+CUDA_HOME="${CUDA_HOME:-/apps/SPACK/0.23.1/opt/linux-ubuntu24.04-x86_64_v3/gcc-13.3.0/cuda-12.4.1-cwwkrpu24rnxndj5ouklz26aiskqd4is}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 set +u
 conda activate myenv
 set -u
