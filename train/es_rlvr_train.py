@@ -99,9 +99,12 @@ def parse_args():
                         "Previous checkpoint is deleted when a new one is saved.")
     p.add_argument("--n_rollouts_per_prompt", type=int, default=4,
                    help="Completions per prompt per perturbation (K rollouts). Default=4.")
-    p.add_argument("--train_batch_size", type=int, default=16,
+    p.add_argument("--train_batch_size", type=int, default=32,
                    help="Prompts sampled per iteration from the training set. "
-                        "Set to 0 to use all prompts (original behaviour). Default=16.")
+                        "Set to 0 to use all prompts (original behaviour). Default=32.")
+    p.add_argument("--no_logprobs",      action="store_true",
+                   help="Skip logprob computation (pure ES mode). Faster generation, "
+                        "no entropy metrics logged.")
     p.add_argument("--verbose",          action="store_true")
     p.add_argument("--resume_from",      type=str,   default=None,
                    help="Path to checkpoint dir to resume from "
