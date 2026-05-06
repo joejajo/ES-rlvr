@@ -52,7 +52,7 @@ NUM_ENGINES="${NUM_ENGINES:-2}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
 N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-4}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"   # prompts sampled per iteration (128 total)
-GLOBAL_SEED="${GLOBAL_SEED:-}"
+GLOBAL_SEED="${GLOBAL_SEED:-33}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"       # print prompt+response every N iters
 RESUME_FROM="${RESUME_FROM:-}"          # path to checkpoint dir; empty = auto-detect
 # Auto-resume from checkpoints/latest if RESUME_FROM not explicitly set
