@@ -458,9 +458,6 @@ def main(args):
     print(f"  global_seed: {args.global_seed}  sampling_seed: 42")
     print("=" * 70 + "\n")
 
-    train_preds_dir = os.path.join(out_root, "train_preds")
-    os.makedirs(train_preds_dir, exist_ok=True)
-
     # ── Pre-train validation ───────────────────────────────────────────────────
     if args.val_before_train and val_data:
         from eval.inline_val import run_inline_val
@@ -510,7 +507,7 @@ def main(args):
             meta = inflight.pop(h)
             outputs = ray.get(h)
 
-            do_debug = debug_iter and not debug_fired
+            do_debug = args.verbose and debug_iter and not debug_fired
             metrics  = _postprocess_outputs(outputs, iter_batch, debug_print=do_debug)
             del outputs
             gc.collect()
@@ -551,7 +548,10 @@ def main(args):
             for sample in v.get("samples", [])
         ]
         mean_resp_len = float(np.mean(all_resp_lens)) if all_resp_lens else 0.0
-        print(f"[REWARD] mean={mean_r:.4f} std={std_r:.4f} ent={mean_e:.4f} cov={mean_c:.4f} nonzero={nonzero_frac:.2f}")
+        if args.no_logprobs:
+            print(f"[REWARD] mean={mean_r:.4f} std={std_r:.4f} nonzero={nonzero_frac:.2f}")
+        else:
+            print(f"[REWARD] mean={mean_r:.4f} std={std_r:.4f} ent={mean_e:.4f} cov={mean_c:.4f} nonzero={nonzero_frac:.2f}")
 
         writer.add_scalar("reward/mean",         mean_r,       i)
         writer.add_scalar("reward/std",          std_r,        i)
@@ -577,7 +577,7 @@ def main(args):
         saved_this_iter = False
         if (i + 1) % args.save_every == 0:
             jsonl_path = os.path.join(
-                train_preds_dir, f"train_iter{i+1:04d}_{run_tag}.jsonl"
+                train_preds, f"train_iter{i+1:04d}_{run_tag}.jsonl"
             )
             with open(jsonl_path, "w", encoding="utf-8") as f:
                 for s, v in seeds_perf.items():
