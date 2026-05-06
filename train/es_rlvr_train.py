@@ -99,6 +99,9 @@ def parse_args():
                         "Previous checkpoint is deleted when a new one is saved.")
     p.add_argument("--n_rollouts_per_prompt", type=int, default=4,
                    help="Completions per prompt per perturbation (K rollouts). Default=4.")
+    p.add_argument("--train_batch_size", type=int, default=16,
+                   help="Prompts sampled per iteration from the training set. "
+                        "Set to 0 to use all prompts (original behaviour). Default=16.")
     p.add_argument("--verbose",          action="store_true")
     p.add_argument("--resume_from",      type=str,   default=None,
                    help="Path to checkpoint dir to resume from "
@@ -440,7 +443,8 @@ def main(args):
     print(f"  Model     : {args.model_name}")
     print(f"  Pop/σ/α   : {args.population_size} / {args.sigma} / {args.alpha}")
     print(f"  Engines   : {args.num_engines}   Iters: {args.num_iterations}")
-    print(f"  Train     : {len(train_data)} ex   Val: {len(val_data)} ex")
+    _bs = args.train_batch_size if args.train_batch_size > 0 else len(train_data)
+    print(f"  Train     : {len(train_data)} ex (batch {min(_bs, len(train_data))}/iter)   Val: {len(val_data)} ex")
     print(f"  global_seed: {args.global_seed}  sampling_seed: 42")
     print("=" * 70 + "\n")
 
@@ -474,11 +478,16 @@ def main(args):
         seed_iter    = iter(seeds)
         inflight     = {}
 
+        # Sample a fresh mini-batch once per iteration so all perturbations are
+        # evaluated on the same prompts (required for the ES reward comparison).
+        bs = args.train_batch_size if args.train_batch_size > 0 else len(train_data)
+        iter_batch = random.sample(train_data, min(bs, len(train_data)))
+
         for eng_idx, llm in enumerate(engines):
             try: seed = next(seed_iter)
             except StopIteration: break
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
-            h, ts = evaluate_handle(llm, train_data, temperature=args.train_temperature,
+            h, ts = evaluate_handle(llm, iter_batch, temperature=args.train_temperature,
                                     max_tokens=args.max_tokens,
                                     n_rollouts_per_prompt=args.n_rollouts_per_prompt)
             inflight[h] = {"engine": llm, "eng_idx": eng_idx, "seed": seed, "ts": ts}
@@ -507,7 +516,7 @@ def main(args):
             ray.get(meta["engine"].collective_rpc.remote(
                 "perturb_self_weights", args=(next_seed, args.sigma, False)
             ))
-            h, ts = evaluate_handle(meta["engine"], train_data, temperature=args.train_temperature,
+            h, ts = evaluate_handle(meta["engine"], iter_batch, temperature=args.train_temperature,
                                     max_tokens=args.max_tokens,
                                     n_rollouts_per_prompt=args.n_rollouts_per_prompt)
             inflight[h] = {"engine": meta["engine"], "eng_idx": meta["eng_idx"],

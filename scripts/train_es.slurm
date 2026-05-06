@@ -51,6 +51,7 @@ POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-2}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
 N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-4}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"   # prompts sampled per iteration (128 total)
 GLOBAL_SEED="${GLOBAL_SEED:-}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"       # print prompt+response every N iters
 RESUME_FROM="${RESUME_FROM:-}"          # path to checkpoint dir; empty = auto-detect
@@ -81,6 +82,7 @@ python "${SCRIPT}" \
   ${SEED_ARG} \
   ${RESUME_ARG} \
   --n_rollouts_per_prompt "${N_ROLLOUTS_PER_PROMPT}" \
+  --train_batch_size  "${TRAIN_BATCH_SIZE}" \
   --output_every      "${OUTPUT_EVERY}" \
   --train_temperature "${TRAIN_TEMPERATURE}" \
   --val_temperature   "${VAL_TEMPERATURE}" \
