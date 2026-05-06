@@ -5,11 +5,12 @@
 #SBATCH --nodes=1
 #SBATCH --time=16:00:00
 #SBATCH --signal=SIGUSR1@120
-#SBATCH --output=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.out
-#SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.err
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
 #SBATCH --export=NONE
 # =============================================================================
 #  Pure ES — matches VsonicV/es-fine-tuning-paper exactly.
+#  All output (stdout + stderr) goes to outputs/job_<SLURM_JOB_ID>/
 #
 #  Key differences from train_es.slurm:
 #    - --no_logprobs : no logprob overhead, no entropy metrics
@@ -18,6 +19,17 @@
 # =============================================================================
 unset SLURM_EXPORT_ENV
 set -eo pipefail
+
+# ── Per-job output dir — redirect ALL stdout/stderr here ────────────────────
+BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVRTHESIS"
+RUN_DIR="${BASE_DIR}/outputs/job_${SLURM_JOB_ID}"
+mkdir -p "${RUN_DIR}"
+exec > "${RUN_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.out" \
+     2> "${RUN_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.err"
+
+echo "[RUN] Job ${SLURM_JOB_ID} started on $(hostname) at $(date)"
+echo "[RUN] Output dir: ${RUN_DIR}"
+
 module purge
 module load cuda/12.4.1
 module load python/3.12-conda
@@ -29,7 +41,6 @@ set +u
 conda activate myenv
 set -u
 # ── Paths ───────────────────────────────────────────────────────────────────
-BASE_DIR="/home/woody/iwi7/iwi7107h/ESRLVRTHESIS"
 TRAIN_PARQUET="${BASE_DIR}/data/train/pi1_r128.parquet"
 VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
 cd "${BASE_DIR}"
@@ -53,14 +64,11 @@ ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-2}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
-N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-1}"   # 1: no entropy, T=0.6 sampling
+N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-1}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
-GLOBAL_SEED="${GLOBAL_SEED:-33}"                       # paper's initial_seed=33
+GLOBAL_SEED="${GLOBAL_SEED:-33}"
 OUTPUT_EVERY="${OUTPUT_EVERY:-1}"
 RESUME_FROM="${RESUME_FROM:-}"
-RUN_DIR="${BASE_DIR}/outputs/job_${SLURM_JOB_ID}"
-mkdir -p "${RUN_DIR}"
-echo "[RUN] Output dir: ${RUN_DIR}"
 # Auto-resume from checkpoints/latest if RESUME_FROM not explicitly set
 if [[ -z "${RESUME_FROM}" && -L "${BASE_DIR}/checkpoints/latest" ]]; then
     RESUME_FROM="$(readlink -f "${BASE_DIR}/checkpoints/latest")"
@@ -87,6 +95,7 @@ if [[ -z "${RESUME_FROM}" ]]; then
         --cuda_devices  0 \
         --output_dir    "${RUN_DIR}/baseline"
 fi
+# ── Training ─────────────────────────────────────────────────────────────────
 SCRIPT="${BASE_DIR}/train/es_rlvr_train.py"
 SEED_ARG=""
 [[ -n "${GLOBAL_SEED}" ]] && SEED_ARG="--global_seed ${GLOBAL_SEED}"
@@ -114,4 +123,4 @@ python "${SCRIPT}" \
   --output_dir        "${RUN_DIR}" \
   --no_logprobs \
   --verbose
-echo "Job complete: ${SLURM_JOB_ID}"
+echo "Job complete: ${SLURM_JOB_ID} at $(date)"

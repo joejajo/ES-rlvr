@@ -510,7 +510,7 @@ def main(args):
             outputs = ray.get(h)
 
             do_debug = debug_iter and not debug_fired
-            metrics  = _postprocess_outputs(outputs, train_data, debug_print=do_debug)
+            metrics  = _postprocess_outputs(outputs, iter_batch, debug_print=do_debug)
             del outputs
             gc.collect()
             if do_debug:
