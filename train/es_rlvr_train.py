@@ -458,7 +458,8 @@ def main(args):
     print(f"  global_seed: {args.global_seed}  sampling_seed: 42")
     print("=" * 70 + "\n")
 
-    train_jsonl = os.path.join(out_root, f"train_{run_tag}.jsonl")
+    train_preds_dir = os.path.join(out_root, "train_preds")
+    os.makedirs(train_preds_dir, exist_ok=True)
 
     # ── Pre-train validation ───────────────────────────────────────────────────
     if args.val_before_train and val_data:
@@ -572,13 +573,17 @@ def main(args):
         ])
         ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
 
-        # ── Every save_every iters: checkpoint (updated weights) ─────────────
+        # ── Every save_every iters: checkpoint + per-iter JSONL ─────────────
         saved_this_iter = False
         if (i + 1) % args.save_every == 0:
-            with open(train_jsonl, "a", encoding="utf-8") as f:
+            jsonl_path = os.path.join(
+                train_preds_dir, f"train_iter{i+1:04d}_{run_tag}.jsonl"
+            )
+            with open(jsonl_path, "w", encoding="utf-8") as f:
                 for s, v in seeds_perf.items():
                     for sample in v.get("samples", []):
                         f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
+            print(f"[JSONL] Saved → {jsonl_path}")
             last_ckpt = _save_checkpoint(i, last_ckpt)
             saved_this_iter = True
 
