@@ -72,15 +72,18 @@ if [[ -z "${RESUME_FROM}" ]]; then
         --parquet_path  "${VAL_PARQUET}" \
         --temperature   0.6 \
         --cuda_devices  0 \
-        --output_dir    "${BASE_DIR}/outputs/baseline_eval"
+        --output_dir    "${RUN_DIR}/baseline"
     echo "[BASELINE] Evaluating base model greedy (T=0.0) ..."
     CUDA_VISIBLE_DEVICES=0 python -m eval.final_math500 \
         --model_path    "${MODEL_NAME}" \
         --parquet_path  "${VAL_PARQUET}" \
         --temperature   0.0 \
         --cuda_devices  0 \
-        --output_dir    "${BASE_DIR}/outputs/baseline_eval"
+        --output_dir    "${RUN_DIR}/baseline"
 fi
+RUN_DIR="${BASE_DIR}/outputs/job_${SLURM_JOB_ID}"
+mkdir -p "${RUN_DIR}"
+echo "[RUN] Output dir: ${RUN_DIR}"
 SCRIPT="${BASE_DIR}/train/es_rlvr_train.py"
 SEED_ARG=""
 [[ -n "${GLOBAL_SEED}" ]] && SEED_ARG="--global_seed ${GLOBAL_SEED}"
@@ -105,5 +108,6 @@ python "${SCRIPT}" \
   --val_temperature   "${VAL_TEMPERATURE}" \
   --save_every        "${SAVE_EVERY}" \
   --val_every         "${VAL_EVERY}" \
+  --output_dir        "${RUN_DIR}" \
   --verbose
 echo "Job complete: ${SLURM_JOB_ID}"

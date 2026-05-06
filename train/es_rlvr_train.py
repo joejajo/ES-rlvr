@@ -105,6 +105,9 @@ def parse_args():
     p.add_argument("--no_logprobs",      action="store_true",
                    help="Skip logprob computation (pure ES mode). Faster generation, "
                         "no entropy metrics logged.")
+    p.add_argument("--output_dir",       type=str,   default="outputs",
+                   help="Root directory for all run outputs (train_preds, val_preds, tb). "
+                        "Default: outputs/")
     p.add_argument("--verbose",          action="store_true")
     p.add_argument("--resume_from",      type=str,   default=None,
                    help="Path to checkpoint dir to resume from "
@@ -327,9 +330,10 @@ def main(args):
     ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
 
     run_tag     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    train_preds = os.path.join("outputs", "train_preds")
-    val_preds   = os.path.join("outputs", "val_preds")
-    tb_dir      = os.path.join("outputs", "tb", f"run_{run_tag}")
+    out_root    = args.output_dir
+    train_preds = os.path.join(out_root, "train_preds")
+    val_preds   = os.path.join(out_root, "val_preds")
+    tb_dir      = os.path.join(out_root, "tb", f"run_{run_tag}")
     for d in (train_preds, val_preds):
         os.makedirs(d, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
@@ -454,7 +458,7 @@ def main(args):
     print(f"  global_seed: {args.global_seed}  sampling_seed: 42")
     print("=" * 70 + "\n")
 
-    train_jsonl = os.path.join(train_preds, f"train_{run_tag}.jsonl")
+    train_jsonl = os.path.join(out_root, f"train_{run_tag}.jsonl")
 
     # ── Pre-train validation ───────────────────────────────────────────────────
     if args.val_before_train and val_data:
