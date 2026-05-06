@@ -211,16 +211,19 @@ def load_task_datas(parquet_path: str, tokenizer, max_prompt_tokens: int = 1024)
 # Generation + reward
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=4096, n_rollouts_per_prompt=1):
+def evaluate_handle(llm, task_datas, temperature=0.7, max_tokens=4096,
+                    n_rollouts_per_prompt=1, no_logprobs=False):
+    sp = SamplingParams(
+        temperature=temperature,
+        max_tokens=max_tokens,
+        seed=42,
+        n=n_rollouts_per_prompt,
+    )
+    if not no_logprobs:
+        sp.logprobs = 20
     handle = llm.generate.remote(
         [d["prompt_str"] for d in task_datas],
-        SamplingParams(
-            temperature=temperature,
-            max_tokens=max_tokens,
-            logprobs=20,
-            seed=42,
-            n=n_rollouts_per_prompt,
-        ),
+        sp,
         use_tqdm=False,
     )
     return handle, time.time()
@@ -492,7 +495,8 @@ def main(args):
             ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
             h, ts = evaluate_handle(llm, iter_batch, temperature=args.train_temperature,
                                     max_tokens=args.max_tokens,
-                                    n_rollouts_per_prompt=args.n_rollouts_per_prompt)
+                                    n_rollouts_per_prompt=args.n_rollouts_per_prompt,
+                                    no_logprobs=args.no_logprobs)
             inflight[h] = {"engine": llm, "eng_idx": eng_idx, "seed": seed, "ts": ts}
 
         while inflight:
@@ -521,7 +525,8 @@ def main(args):
             ))
             h, ts = evaluate_handle(meta["engine"], iter_batch, temperature=args.train_temperature,
                                     max_tokens=args.max_tokens,
-                                    n_rollouts_per_prompt=args.n_rollouts_per_prompt)
+                                    n_rollouts_per_prompt=args.n_rollouts_per_prompt,
+                                    no_logprobs=args.no_logprobs)
             inflight[h] = {"engine": meta["engine"], "eng_idx": meta["eng_idx"],
                            "seed": next_seed, "ts": ts}
 
@@ -547,8 +552,9 @@ def main(args):
         writer.add_scalar("reward/std",          std_r,        i)
         writer.add_scalar("reward/min",          float(min(all_r)) if all_r else 0.0, i)
         writer.add_scalar("reward/max",          float(max(all_r)) if all_r else 0.0, i)
-        writer.add_scalar("reward/entropy",      mean_e,       i)
-        writer.add_scalar("reward/coverage",     mean_c,       i)
+        if not args.no_logprobs:
+            writer.add_scalar("reward/entropy",  mean_e,       i)
+            writer.add_scalar("reward/coverage", mean_c,       i)
         writer.add_scalar("train/nonzero_frac",  nonzero_frac, i)
         writer.add_scalar("train/mean_response_len", mean_resp_len, i)
 

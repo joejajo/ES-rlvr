@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=es_rlvr
+#SBATCH --job-name=es_pure
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:a100:2
 #SBATCH --nodes=1
@@ -9,9 +9,12 @@
 #SBATCH --error=/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/outputs/%x_%j.err
 #SBATCH --export=NONE
 # =============================================================================
-#  ES-RLVR — 2-GPU SLURM script
+#  Pure ES — matches VsonicV/es-fine-tuning-paper exactly.
 #
-#  One-Shot-RLVR + vLLM + Ray + NCCL, 2 engines across 2 GPUs.
+#  Key differences from train_es.slurm:
+#    - --no_logprobs : no logprob overhead, no entropy metrics
+#    - n_rollouts=1  : T=0.6 sampling; 1 rollout keeps compute low
+#    - train_batch=32, T=0.6 for both train and val
 # =============================================================================
 unset SLURM_EXPORT_ENV
 set -eo pipefail
@@ -50,11 +53,11 @@ ALPHA="${ALPHA:-0.0005}"
 POPULATION_SIZE="${POPULATION_SIZE:-30}"
 NUM_ENGINES="${NUM_ENGINES:-2}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"
-N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-4}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"   # prompts sampled per iteration (128 total)
-GLOBAL_SEED="${GLOBAL_SEED:-}"
-OUTPUT_EVERY="${OUTPUT_EVERY:-1}"       # print prompt+response every N iters
-RESUME_FROM="${RESUME_FROM:-}"          # path to checkpoint dir; empty = auto-detect
+N_ROLLOUTS_PER_PROMPT="${N_ROLLOUTS_PER_PROMPT:-1}"   # 1: no entropy, T=0.6 sampling
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
+GLOBAL_SEED="${GLOBAL_SEED:-33}"                       # paper's initial_seed=33
+OUTPUT_EVERY="${OUTPUT_EVERY:-1}"
+RESUME_FROM="${RESUME_FROM:-}"
 # Auto-resume from checkpoints/latest if RESUME_FROM not explicitly set
 if [[ -z "${RESUME_FROM}" && -L "${BASE_DIR}/checkpoints/latest" ]]; then
     RESUME_FROM="$(readlink -f "${BASE_DIR}/checkpoints/latest")"
@@ -105,5 +108,6 @@ python "${SCRIPT}" \
   --val_temperature   "${VAL_TEMPERATURE}" \
   --save_every        "${SAVE_EVERY}" \
   --val_every         "${VAL_EVERY}" \
+  --no_logprobs \
   --verbose
 echo "Job complete: ${SLURM_JOB_ID}"
