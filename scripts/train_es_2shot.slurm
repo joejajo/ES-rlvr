@@ -105,26 +105,26 @@ SEED_ARG=""
 RESUME_ARG=""
 [[ -n "${RESUME_FROM}" ]] && RESUME_ARG="--resume_from ${RESUME_FROM}"
 python "${SCRIPT}" \
-  --model_name        "${MODEL_NAME}" \
-  --parquet_path      "${TRAIN_PARQUET}" \
-  --val_parquet_path  "${VAL_PARQUET}" \
-  --sigma             "${SIGMA}" \
-  --alpha             "${ALPHA}" \
-  --population_size   "${POPULATION_SIZE}" \
-  --num_engines       "${NUM_ENGINES}" \
-  --num_iterations    "${NUM_ITERATIONS}" \
-  --cuda_devices      0,1 \
+  --model_name            "${MODEL_NAME}" \
+  --parquet_path          "${TRAIN_PARQUET}" \
+  --val_parquet_path      "${VAL_PARQUET}" \
+  --sigma                 "${SIGMA}" \
+  --alpha                 "${ALPHA}" \
+  --population_size       "${POPULATION_SIZE}" \
+  --num_engines           "${NUM_ENGINES}" \
+  --num_iterations        "${NUM_ITERATIONS}" \
+  --cuda_devices          0,1 \
   ${SEED_ARG} \
   ${RESUME_ARG} \
   --n_rollouts_per_prompt "${N_ROLLOUTS_PER_PROMPT}" \
-  --train_batch_size  "${TRAIN_BATCH_SIZE}" \
-  --output_every      "${OUTPUT_EVERY}" \
-  --train_temperature "${TRAIN_TEMPERATURE}" \
-  --val_temperature   "${VAL_TEMPERATURE}" \
-  --save_every        "${SAVE_EVERY}" \
-  --val_every         "${VAL_EVERY}" \
-  --output_dir        "${RUN_DIR}" \
-  --checkpoint_dir    "${CHECKPOINT_DIR}" \
+  --train_batch_size      "${TRAIN_BATCH_SIZE}" \
+  --output_every          "${OUTPUT_EVERY}" \
+  --train_temperature     "${TRAIN_TEMPERATURE}" \
+  --val_temperature       "${VAL_TEMPERATURE}" \
+  --save_every            "${SAVE_EVERY}" \
+  --val_every             "${VAL_EVERY}" \
+  --output_dir            "${RUN_DIR}" \
+  --checkpoint_dir        "${CHECKPOINT_DIR}" \
   --no_logprobs \
   --metrics_only \
   --verbose
