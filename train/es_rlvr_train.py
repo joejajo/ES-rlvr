@@ -112,6 +112,9 @@ def parse_args():
     p.add_argument("--metrics_only",     action="store_true",
                    help="Save only reward metrics in JSONL (no model responses). "
                         "Saves disk space for ablation runs.")
+    p.add_argument("--checkpoint_dir",   type=str,   default="checkpoints",
+                   help="Directory for saving checkpoints and latest symlink. "
+                        "Use a unique path per dataset to avoid cross-run collisions.")
     p.add_argument("--resume_from",      type=str,   default=None,
                    help="Path to checkpoint dir to resume from "
                         "(must contain pytorch_model.pth + resume_state.json).")
@@ -426,16 +429,19 @@ def main(args):
             except Exception: pass
         ray.shutdown()
 
+    ckpt_root = args.checkpoint_dir
+    os.makedirs(ckpt_root, exist_ok=True)
+
     def _save_checkpoint(i, last_ckpt):
-        """Save post-update weights; update checkpoints/latest symlink; delete previous."""
-        iter_ckpt = os.path.join("checkpoints", f"iter{i+1}_{run_tag}")
+        """Save post-update weights; update <checkpoint_dir>/latest symlink; delete previous."""
+        iter_ckpt = os.path.join(ckpt_root, f"iter{i+1}_{run_tag}")
         os.makedirs(iter_ckpt, exist_ok=True)
         ckpt_pth = os.path.join(iter_ckpt, "pytorch_model.pth")
         ray.get(engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(ckpt_pth,)))
         with open(os.path.join(iter_ckpt, "resume_state.json"), "w") as f:
             json.dump({"last_iter": i, "run_tag": run_tag}, f, indent=2)
         print(f"[CKPT] Saved → {iter_ckpt}")
-        latest_link = os.path.join("checkpoints", "latest")
+        latest_link = os.path.join(ckpt_root, "latest")
         if os.path.islink(latest_link):
             os.remove(latest_link)
         os.symlink(os.path.abspath(iter_ckpt), latest_link)
@@ -488,7 +494,14 @@ def main(args):
         print(f"\n=== Iteration {i} ===", flush=True)
         t0 = time.time()
 
-        seeds      = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
+        # Use a set to guarantee uniqueness — avoids silent IDX collision in seed_order
+        _seen = set()
+        seeds = []
+        while len(seeds) < args.population_size:
+            s = random.randint(0, 10_000_000)
+            if s not in _seen:
+                _seen.add(s)
+                seeds.append(s)
         seed_order = {s: idx for idx, s in enumerate(seeds)}
         seeds_perf = {}
         debug_iter  = (i % args.output_every == 0)
@@ -604,7 +617,8 @@ def main(args):
         for seed in seeds:
             if seed in seeds_perf:
                 v   = seeds_perf[seed]
-                tok = float(np.mean([s["num_tokens"] for s in v.get("samples", [])] or [0]))
+                _toks = [s["num_tokens"] for s in v.get("samples", [])]
+                tok = float(np.mean(_toks)) if _toks else 0.0
                 print(f"IDX:{seed_order[seed]} Seed {seed} "
                       f"avg_reward: {v['avg_reward']:.4f}, "
                       f"mean_tokens: {tok:.1f}, time: {v['elapsed']:.2f}s")
