@@ -335,6 +335,8 @@ def _postprocess_outputs(outputs, task_datas, debug_print=False):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main(args):
+    from eval.inline_val import run_inline_val
+
     for var in ("RAY_ADDRESS", "RAY_HEAD_IP", "RAY_GCS_SERVER_ADDRESS"):
         os.environ.pop(var, None)
     ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
@@ -473,7 +475,6 @@ def main(args):
 
     # ── Pre-train validation ───────────────────────────────────────────────────
     if args.val_before_train and val_data:
-        from eval.inline_val import run_inline_val
         pre_val = run_inline_val(
             engines[0], val_data,
             out_dir=val_preds, run_tag=run_tag, iteration=-1,
@@ -656,7 +657,6 @@ def main(args):
 
         # ── Every val_every iters: inline validation ──────────────────────────
         if val_data and args.val_every > 0 and (i + 1) % args.val_every == 0:
-            from eval.inline_val import run_inline_val
             val = run_inline_val(
                 engines[0], val_data,
                 out_dir=val_preds, run_tag=run_tag, iteration=i + 1,
@@ -684,6 +684,7 @@ def main(args):
             else:
                 print("[PREEMPT] Checkpoint already saved this iteration — exiting.")
             writer.flush()
+            writer.close()
             cleanup()
             sys.exit(0)
 
