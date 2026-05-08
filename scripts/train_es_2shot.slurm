@@ -45,7 +45,7 @@ set +u
 conda activate myenv
 set -u
 # ── Paths ───────────────────────────────────────────────────────────────────
-TRAIN_PARQUET="${BASE_DIR}/data/train/merge_pi1_pi13_r128.parquet"
+TRAIN_PARQUET="/home/woody/iwi7/iwi7107h/ESRLVRTHESIS/data/train/merge_pi1_pi13_r128.parquet"
 VAL_PARQUET="${BASE_DIR}/data/val/math500.parquet"
 cd "${BASE_DIR}"
 # ── Environment variables ────────────────────────────────────────────────────
