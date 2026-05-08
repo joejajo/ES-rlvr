@@ -125,5 +125,6 @@ python "${SCRIPT}" \
   --val_every         "${VAL_EVERY}" \
   --output_dir        "${RUN_DIR}" \
   --no_logprobs \
+  --metrics_only \
   --verbose
 echo "Job complete: ${SLURM_JOB_ID} at $(date)"

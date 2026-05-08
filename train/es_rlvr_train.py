@@ -109,6 +109,9 @@ def parse_args():
                    help="Root directory for all run outputs (train_preds, val_preds, tb). "
                         "Default: outputs/")
     p.add_argument("--verbose",          action="store_true")
+    p.add_argument("--metrics_only",     action="store_true",
+                   help="Save only reward metrics in JSONL (no model responses). "
+                        "Saves disk space for ablation runs.")
     p.add_argument("--resume_from",      type=str,   default=None,
                    help="Path to checkpoint dir to resume from "
                         "(must contain pytorch_model.pth + resume_state.json).")
@@ -579,10 +582,13 @@ def main(args):
             jsonl_path = os.path.join(
                 train_preds, f"train_iter{i+1:04d}_{run_tag}.jsonl"
             )
+            _drop = {"question", "model_response", "all_model_responses", "all_extracted_answers"}
             with open(jsonl_path, "w", encoding="utf-8") as f:
                 for s, v in seeds_perf.items():
                     for sample in v.get("samples", []):
-                        f.write(json.dumps({"iter": i, "seed": s, **sample}, ensure_ascii=False) + "\n")
+                        row = {k: val for k, val in sample.items()
+                               if not (args.metrics_only and k in _drop)}
+                        f.write(json.dumps({"iter": i, "seed": s, **row}, ensure_ascii=False) + "\n")
             print(f"[JSONL] Saved → {jsonl_path}")
             last_ckpt = _save_checkpoint(i, last_ckpt)
             saved_this_iter = True
