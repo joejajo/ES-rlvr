@@ -59,8 +59,9 @@ def run_inline_val(engine, val_task_datas, out_dir, run_tag, iteration,
 
     scores, records = [], []
     for idx, (output, data) in enumerate(zip(outputs, val_task_datas)):
-        completion = output.outputs[0].text
-        score = compute_training_score(completion, data["ground_truth"])
+        completion  = output.outputs[0].text
+        num_tokens  = len(output.outputs[0].token_ids)
+        score       = compute_training_score(completion, data["ground_truth"])
         scores.append(score)
         diag = _score_reason(completion, data["ground_truth"])
         records.append({
@@ -69,6 +70,7 @@ def run_inline_val(engine, val_task_datas, out_dir, run_tag, iteration,
             "ground_truth":   data["ground_truth"],
             "model_response": completion,
             "score":          score,
+            "num_tokens":     num_tokens,
             "response_len":   len(completion),
             **diag,
         })
@@ -80,24 +82,32 @@ def run_inline_val(engine, val_task_datas, out_dir, run_tag, iteration,
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    num_correct      = int(round(sum(scores)))
-    num_parse_ok     = sum(int(r["parse_ok"])    for r in records)
-    num_boxed        = sum(int(r["boxed_found"]) for r in records)
-    mean_resp_len    = float(np.mean([r["response_len"] for r in records])) if records else 0.0
-    parse_ok_frac    = num_parse_ok / len(records) if records else 0.0
-    boxed_frac       = num_boxed    / len(records) if records else 0.0
-    print(
-        f"[VAL] iter={iteration}  acc={accuracy*100:.2f}%"
-        f"  ({num_correct}/{len(scores)})"
-        f"  parse_ok={num_parse_ok}/{len(records)}"
-        f"  boxed={num_boxed}/{len(records)}"
-        f"  mean_len={mean_resp_len:.0f}"
-        f"  T={temperature}  {elapsed:.1f}s  → {out_path}"
-    )
+    num_correct   = int(round(sum(scores)))
+    num_parse_ok  = sum(int(r["parse_ok"])    for r in records)
+    num_boxed     = sum(int(r["boxed_found"]) for r in records)
+    num_wrong     = len(records) - num_correct
+    parse_ok_frac = num_parse_ok / len(records) if records else 0.0
+    boxed_frac    = num_boxed    / len(records) if records else 0.0
+    mean_resp_len = float(np.mean([r["response_len"] for r in records])) if records else 0.0
+    mean_tokens   = float(np.mean([r["num_tokens"]   for r in records])) if records else 0.0
+    min_tokens    = int(min(r["num_tokens"] for r in records)) if records else 0
+    max_tokens    = int(max(r["num_tokens"] for r in records)) if records else 0
+
+    print(f"\n{'='*60}")
+    print(f"  [VAL] iter={iteration}  T={temperature}  elapsed={elapsed:.1f}s")
+    print(f"  Accuracy   : {accuracy*100:.2f}%  ({num_correct} correct / {len(scores)} total / {num_wrong} wrong)")
+    print(f"  Parse OK   : {num_parse_ok}/{len(records)}  ({parse_ok_frac*100:.1f}%)")
+    print(f"  Boxed      : {num_boxed}/{len(records)}  ({boxed_frac*100:.1f}%)")
+    print(f"  Tokens     : mean={mean_tokens:.1f}  min={min_tokens}  max={max_tokens}")
+    print(f"  Char len   : mean={mean_resp_len:.0f}")
+    print(f"  Saved      : {out_path}")
+    print(f"{'='*60}\n")
+
     return {
-        "accuracy":        accuracy,
-        "parse_ok_frac":   parse_ok_frac,
-        "boxed_frac":      boxed_frac,
+        "accuracy":          accuracy,
+        "parse_ok_frac":     parse_ok_frac,
+        "boxed_frac":        boxed_frac,
         "mean_response_len": mean_resp_len,
-        "elapsed":         elapsed,
+        "mean_tokens":       mean_tokens,
+        "elapsed":           elapsed,
     }

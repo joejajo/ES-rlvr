@@ -485,6 +485,7 @@ def main(args):
         writer.add_scalar("val/parse_ok_frac",     pre_val["parse_ok_frac"],     0)
         writer.add_scalar("val/boxed_frac",        pre_val["boxed_frac"],        0)
         writer.add_scalar("val/mean_response_len", pre_val["mean_response_len"], 0)
+        writer.add_scalar("val/mean_tokens",       pre_val["mean_tokens"],       0)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     last_ckpt = None  # track most recent checkpoint for deletion on next save
@@ -667,6 +668,7 @@ def main(args):
             writer.add_scalar("val/parse_ok_frac",     val["parse_ok_frac"],     i)
             writer.add_scalar("val/boxed_frac",        val["boxed_frac"],        i)
             writer.add_scalar("val/mean_response_len", val["mean_response_len"], i)
+            writer.add_scalar("val/mean_tokens",       val["mean_tokens"],       i)
 
         wall_time = time.time() - t0
         writer.add_scalar("time/iter", wall_time, i)
