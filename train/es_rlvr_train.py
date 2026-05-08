@@ -274,6 +274,7 @@ def _postprocess_outputs(outputs, task_datas, debug_print=False):
 
     for idx, (output, data) in enumerate(zip(outputs, task_datas)):
         rollout_texts   = [o.text for o in output.outputs]
+        rollout_tokens  = [len(o.token_ids) for o in output.outputs]
         rollout_rewards = [
             compute_training_score(text, data["ground_truth"])
             for text in rollout_texts
@@ -285,7 +286,8 @@ def _postprocess_outputs(outputs, task_datas, debug_print=False):
         entropies.append(ent)
         coverages.append(cov)
 
-        primary_text = rollout_texts[0] if rollout_texts else ""
+        primary_text   = rollout_texts[0] if rollout_texts else ""
+        primary_tokens = rollout_tokens[0] if rollout_tokens else 0
         samples.append({
             "sample_idx":            idx,
             "question":              data.get("question", ""),
@@ -296,6 +298,8 @@ def _postprocess_outputs(outputs, task_datas, debug_print=False):
             "ground_truth":          data.get("ground_truth", ""),
             "binary_reward":         prompt_reward,
             "all_binary_rewards":    rollout_rewards,
+            "num_tokens":            primary_tokens,
+            "all_num_tokens":        rollout_tokens,
             "entropy":               ent,
             "entropy_coverage":      cov,
         })
@@ -478,22 +482,26 @@ def main(args):
 
     # ── Training loop ─────────────────────────────────────────────────────────
     last_ckpt = None  # track most recent checkpoint for deletion on next save
+    _drop_fields = {"question", "model_response", "all_model_responses", "all_extracted_answers"}
+
     for i in range(start_iter, args.num_iterations):
-        print(f"{'─'*50}  iter {i}/{args.num_iterations-1}")
+        print(f"\n=== Iteration {i} ===", flush=True)
         t0 = time.time()
 
-        seeds        = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
-        seeds_perf   = {}
-        debug_iter   = (i % args.output_every == 0)
-        debug_fired  = False
-        seed_iter    = iter(seeds)
-        inflight     = {}
+        seeds      = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
+        seed_order = {s: idx for idx, s in enumerate(seeds)}
+        seeds_perf = {}
+        debug_iter  = (i % args.output_every == 0)
+        debug_fired = False
+        seed_iter   = iter(seeds)
+        inflight    = {}
 
         # Sample a fresh mini-batch once per iteration so all perturbations are
         # evaluated on the same prompts (required for the ES reward comparison).
         bs = args.train_batch_size if args.train_batch_size > 0 else len(train_data)
         iter_batch = random.sample(train_data, min(bs, len(train_data)))
 
+        # ── Dispatch initial seeds ────────────────────────────────────────────
         for eng_idx, llm in enumerate(engines):
             try: seed = next(seed_iter)
             except StopIteration: break
@@ -503,15 +511,19 @@ def main(args):
                                     n_rollouts_per_prompt=args.n_rollouts_per_prompt,
                                     no_logprobs=args.no_logprobs)
             inflight[h] = {"engine": llm, "eng_idx": eng_idx, "seed": seed, "ts": ts}
+            print(f"Scheduled seed {seed} on engine {eng_idx + 1}", flush=True)
 
+        # ── Collect results, dispatch next seed when engine frees up ─────────
         while inflight:
             done, _ = ray.wait(list(inflight.keys()), num_returns=1)
             h    = done[0]
             meta = inflight.pop(h)
             outputs = ray.get(h)
+            elapsed = time.time() - meta["ts"]
 
             do_debug = args.verbose and debug_iter and not debug_fired
             metrics  = _postprocess_outputs(outputs, iter_batch, debug_print=do_debug)
+            metrics["elapsed"] = elapsed
             del outputs
             gc.collect()
             if do_debug:
@@ -534,39 +546,44 @@ def main(args):
                                     no_logprobs=args.no_logprobs)
             inflight[h] = {"engine": meta["engine"], "eng_idx": meta["eng_idx"],
                            "seed": next_seed, "ts": ts}
+            print(f"Scheduled seed {next_seed} on engine {meta['eng_idx'] + 1}", flush=True)
 
-        # GRPO normalisation
-        all_r  = [v["avg_reward"]  for v in seeds_perf.values()]
+        # ── Population stats + z-score normalisation ─────────────────────────
+        all_r  = [v["avg_reward"] for v in seeds_perf.values()]
         mean_r = float(np.mean(all_r)) if all_r else 0.0
         std_r  = float(np.std(all_r))  if all_r else 0.0
+        min_r  = float(min(all_r))     if all_r else 0.0
+        max_r  = float(max(all_r))     if all_r else 0.0
         for v in seeds_perf.values():
             v["norm"] = (v["avg_reward"] - mean_r) / (std_r + 1e-8)
 
-        mean_e       = float(np.mean([v["avg_entropy"]  for v in seeds_perf.values()])) if seeds_perf else 0.0
-        mean_c       = float(np.mean([v["avg_coverage"] for v in seeds_perf.values()])) if seeds_perf else 0.0
-        nonzero_frac = float(sum(1 for r in all_r if r > 0) / len(all_r)) if all_r else 0.0
-        all_resp_lens = [
-            len(sample["model_response"])
-            for v in seeds_perf.values()
-            for sample in v.get("samples", [])
-        ]
-        mean_resp_len = float(np.mean(all_resp_lens)) if all_resp_lens else 0.0
+        all_samples    = [s for v in seeds_perf.values() for s in v.get("samples", [])]
+        correct_frac   = float(sum(1 for s in all_samples if s["binary_reward"] == 1.0) / len(all_samples)) if all_samples else 0.0
+        no_answer_frac = float(sum(1 for s in all_samples if not s.get("extracted_answer","")) / len(all_samples)) if all_samples else 0.0
+        mean_e         = float(np.mean([v["avg_entropy"]  for v in seeds_perf.values()])) if seeds_perf else 0.0
+        mean_c         = float(np.mean([v["avg_coverage"] for v in seeds_perf.values()])) if seeds_perf else 0.0
+        nonzero_frac   = float(sum(1 for r in all_r if r > 0) / len(all_r)) if all_r else 0.0
+        all_tokens     = [s["num_tokens"] for v in seeds_perf.values() for s in v.get("samples", [])]
+        mean_tokens    = float(np.mean(all_tokens))    if all_tokens    else 0.0
+        max_tokens_gen = int(max(all_tokens))          if all_tokens    else 0
+        min_tokens_gen = int(min(all_tokens))          if all_tokens    else 0
+        all_resp_lens  = [len(s["model_response"]) for v in seeds_perf.values() for s in v.get("samples", [])]
+        mean_resp_len  = float(np.mean(all_resp_lens)) if all_resp_lens else 0.0
+
+        print(f"Mean reward: {mean_r:.4f}, std: {std_r:.4f}, min: {min_r:.4f}, max: {max_r:.4f}")
+        print(f"Rollout tokens: mean={mean_tokens:.1f}, min={min_tokens_gen}, max={max_tokens_gen}")
         if args.no_logprobs:
-            print(f"[REWARD] mean={mean_r:.4f} std={std_r:.4f} nonzero={nonzero_frac:.2f}")
+            print(f"Avg correct: {correct_frac:.3f}, no_answer: {no_answer_frac:.3f}, nonzero: {nonzero_frac:.3f}")
         else:
-            print(f"[REWARD] mean={mean_r:.4f} std={std_r:.4f} ent={mean_e:.4f} cov={mean_c:.4f} nonzero={nonzero_frac:.2f}")
+            print(f"Avg correct: {correct_frac:.3f}, no_answer: {no_answer_frac:.3f}, "
+                  f"nonzero: {nonzero_frac:.3f}, ent: {mean_e:.4f}, cov: {mean_c:.4f}")
 
-        writer.add_scalar("reward/mean",         mean_r,       i)
-        writer.add_scalar("reward/std",          std_r,        i)
-        writer.add_scalar("reward/min",          float(min(all_r)) if all_r else 0.0, i)
-        writer.add_scalar("reward/max",          float(max(all_r)) if all_r else 0.0, i)
-        if not args.no_logprobs:
-            writer.add_scalar("reward/entropy",  mean_e,       i)
-            writer.add_scalar("reward/coverage", mean_c,       i)
-        writer.add_scalar("train/nonzero_frac",  nonzero_frac, i)
-        writer.add_scalar("train/mean_response_len", mean_resp_len, i)
+        for seed in seeds:
+            if seed in seeds_perf:
+                print(f"Seed {seed} normalized reward: {seeds_perf[seed]['norm']:.4f}")
 
-        # ES update on engine 0 then broadcast
+        # ── ES update: apply all perturbations → broadcast ────────────────────
+        t_perturb = time.time()
         ray.get([
             engines[0].collective_rpc.remote(
                 "perturb_self_weights",
@@ -574,20 +591,49 @@ def main(args):
             )
             for s, v in seeds_perf.items()
         ])
-        ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
+        t_perturb = time.time() - t_perturb
 
-        # ── Every save_every iters: checkpoint + per-iter JSONL ─────────────
+        t_bcast = time.time()
+        ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
+        t_bcast = time.time() - t_bcast
+
+        print(f"Applied perturbations in {t_perturb:.2f}s")
+        print(f"Broadcasted updated weights in {t_bcast:.2f}s")
+
+        # ── Per-seed result lines (in original seed order) ────────────────────
+        for seed in seeds:
+            if seed in seeds_perf:
+                v   = seeds_perf[seed]
+                tok = float(np.mean([s["num_tokens"] for s in v.get("samples", [])] or [0]))
+                print(f"IDX:{seed_order[seed]} Seed {seed} "
+                      f"avg_reward: {v['avg_reward']:.4f}, "
+                      f"mean_tokens: {tok:.1f}, time: {v['elapsed']:.2f}s")
+
+        # ── TensorBoard ───────────────────────────────────────────────────────
+        writer.add_scalar("reward/mean",              mean_r,       i)
+        writer.add_scalar("reward/std",               std_r,        i)
+        writer.add_scalar("reward/min",               min_r,        i)
+        writer.add_scalar("reward/max",               max_r,        i)
+        writer.add_scalar("train/correct_frac",       correct_frac,   i)
+        writer.add_scalar("train/no_answer_frac",     no_answer_frac, i)
+        writer.add_scalar("train/nonzero_frac",       nonzero_frac,   i)
+        writer.add_scalar("train/mean_tokens",        mean_tokens,    i)
+        writer.add_scalar("train/mean_response_len",  mean_resp_len,  i)
+        if not args.no_logprobs:
+            writer.add_scalar("reward/entropy",       mean_e,       i)
+            writer.add_scalar("reward/coverage",      mean_c,       i)
+
+        # ── Every save_every iters: checkpoint + per-iter JSONL ──────────────
         saved_this_iter = False
         if (i + 1) % args.save_every == 0:
             jsonl_path = os.path.join(
                 train_preds, f"train_iter{i+1:04d}_{run_tag}.jsonl"
             )
-            _drop = {"question", "model_response", "all_model_responses", "all_extracted_answers"}
             with open(jsonl_path, "w", encoding="utf-8") as f:
                 for s, v in seeds_perf.items():
                     for sample in v.get("samples", []):
                         row = {k: val for k, val in sample.items()
-                               if not (args.metrics_only and k in _drop)}
+                               if not (args.metrics_only and k in _drop_fields)}
                         f.write(json.dumps({"iter": i, "seed": s, **row}, ensure_ascii=False) + "\n")
             print(f"[JSONL] Saved → {jsonl_path}")
             last_ckpt = _save_checkpoint(i, last_ckpt)
@@ -608,8 +654,10 @@ def main(args):
             writer.add_scalar("val/boxed_frac",        val["boxed_frac"],        i)
             writer.add_scalar("val/mean_response_len", val["mean_response_len"], i)
 
-        writer.add_scalar("time/iter", time.time() - t0, i)
-        print(f"[ITER] {time.time() - t0:.1f}s\n")
+        wall_time = time.time() - t0
+        writer.add_scalar("time/iter", wall_time, i)
+        print(f"Wall clock time for iteration {i}: {wall_time:.2f}s")
+        print(f"=== Iteration {i} finished ===", flush=True)
         gc.collect()
 
         # ── Preempt checkpoint: SLURM timeout warning (SIGUSR1 / SIGTERM) ────
